@@ -14,6 +14,7 @@ from mlx.nn.layers.moe import (
     Expert,
     MixtureOfExperts,
     _compute_capacity,
+    expert_dispatch,
     expert_combine,
     DispatchMeta,
 )
@@ -330,6 +331,155 @@ class TestMixtureOfExperts(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(combined[0], expected_token0).item())
         # token1: all overflow → should be original (zeros)
         self.assertTrue(mx.array_equal(combined[1], original_tokens[1]).item())
+
+
+class TestVectorizedDispatchCombine(mlx_tests.MLXTestCase):
+    def test_dispatch_combine_duplicate_expert_across_k(self):
+        """Same expert selected by both top_k slots should not collide positions."""
+        N, D = 4, 8
+        num_experts = 4
+        capacity_factor = 2.0  # generous capacity
+
+        tokens = mx.random.normal((N, D))
+        # Force token 0 and token 1 to route to the same expert (expert 0) for both k=0 and k=1
+        expert_indices = mx.array([
+            [0, 0],  # token 0: expert 0 twice
+            [0, 0],  # token 1: expert 0 twice
+            [1, 2],  # token 2: different experts
+            [3, 1],  # token 3: different experts
+        ], dtype=mx.int32)
+        weights = mx.array([
+            [0.6, 0.4],
+            [0.5, 0.5],
+            [0.7, 0.3],
+            [0.8, 0.2],
+        ])
+
+        dispatched, meta = expert_dispatch(
+            tokens, expert_indices, weights,
+            num_experts=num_experts, capacity_factor=capacity_factor,
+        )
+        mx.eval(dispatched, *meta)
+
+        # Positions for token 0 and token 1 should be different across k
+        # (expert_counts accumulation ensures no collision)
+        pos_token0 = meta.positions[0]  # [top_k]
+        pos_token1 = meta.positions[1]  # [top_k]
+
+        # All positions should be >= 0 (no overflow with generous capacity)
+        self.assertTrue(mx.all(meta.positions >= 0).item(),
+                        f"Expected all valid positions, got {meta.positions}")
+
+        # For tokens routed to same expert: k=0 and k=1 positions must differ
+        self.assertNotEqual(pos_token0[0].item(), pos_token0[1].item(),
+                            "Same expert positions should differ across k")
+
+        # Round-trip test: dispatch then combine with identity expert
+        expert_outputs = dispatched  # identity
+        combined = expert_combine(expert_outputs, meta, tokens)
+        mx.eval(combined)
+        # Combined should not contain NaN
+        self.assertTrue(mx.all(mx.isfinite(combined)).item())
+
+    def test_dispatch_combine_overflow_boundary(self):
+        """Capacity boundary: first 2 tokens fit, last 2 overflow."""
+        N, D = 4, 8
+        num_experts = 2
+
+        tokens = mx.ones((N, D))  # all-ones for easy verification
+        # All tokens go to expert 0 for k=0, expert 1 for k=1
+        expert_indices = mx.array([
+            [0, 1],
+            [0, 1],
+            [0, 1],
+            [0, 1],
+        ], dtype=mx.int32)
+        weights = mx.array([
+            [0.6, 0.4],
+            [0.6, 0.4],
+            [0.6, 0.4],
+            [0.6, 0.4],
+        ])
+
+        # capacity = max(1, ceil(4 * 2 * capacity_factor / 2))
+        # With capacity_factor = 0.5: ceil(4 * 2 * 0.5 / 2) = ceil(2.0) = 2
+        dispatched, meta = expert_dispatch(
+            tokens, expert_indices, weights,
+            num_experts=num_experts, capacity_factor=0.5,
+        )
+        mx.eval(dispatched, *meta)
+
+        capacity = meta.capacity
+        self.assertEqual(capacity, 2)
+
+        # For k=0 (expert 0): tokens 0,1 should have positions 0,1; tokens 2,3 overflow
+        positions_k0 = meta.positions[:, 0]
+        mx.eval(positions_k0)
+        self.assertEqual(positions_k0[0].item(), 0)
+        self.assertEqual(positions_k0[1].item(), 1)
+        self.assertEqual(positions_k0[2].item(), -1)  # overflow
+        self.assertEqual(positions_k0[3].item(), -1)  # overflow
+
+        # Overflow mask should be True for tokens 2 and 3
+        self.assertTrue(meta.overflow_mask[2].item())
+        self.assertTrue(meta.overflow_mask[3].item())
+
+    def test_dispatch_combine_empty_batch(self):
+        """N=0 input should produce correct shapes without errors."""
+        D = 8
+        num_experts = 4
+
+        tokens = mx.zeros((0, D))
+        expert_indices = mx.zeros((0, 2), dtype=mx.int32)
+        weights = mx.zeros((0, 2))
+
+        dispatched, meta = expert_dispatch(
+            tokens, expert_indices, weights,
+            num_experts=num_experts, capacity_factor=1.25,
+        )
+        mx.eval(dispatched, *meta)
+
+        # Shape checks
+        self.assertEqual(meta.positions.shape, (0, 2))
+        self.assertEqual(meta.overflow_mask.shape, (0, 1))
+        self.assertEqual(dispatched.shape[0], num_experts)  # experts_per_device
+        self.assertEqual(dispatched.shape[-1], D)
+
+        # Round-trip with combine
+        expert_outputs = dispatched
+        combined = expert_combine(expert_outputs, meta, tokens)
+        mx.eval(combined)
+        self.assertEqual(combined.shape, (0, D))
+
+    def test_combine_all_invalid_residual(self):
+        """All routes invalid → combined should equal original_tokens."""
+        N, D = 4, 8
+        num_experts = 2
+        capacity = 2
+
+        original_tokens = mx.random.normal((N, D))
+        expert_outputs = mx.random.normal((num_experts, capacity, D))
+
+        # Manually construct meta with all-invalid positions
+        positions = mx.full((N, 2), -1, dtype=mx.int32)
+        expert_indices = mx.array([[0, 1]] * N, dtype=mx.int32)
+        weights = mx.array([[0.5, 0.5]] * N)
+        overflow_mask = mx.ones((N, 1), dtype=mx.bool_)
+
+        meta = DispatchMeta(
+            expert_indices=expert_indices,
+            weights=weights,
+            positions=positions,
+            overflow_mask=overflow_mask,
+            num_experts=num_experts,
+            capacity=capacity,
+            world_size=1,
+        )
+
+        combined = expert_combine(expert_outputs, meta, original_tokens)
+        mx.eval(combined)
+
+        self.assertTrue(mx.allclose(combined, original_tokens).item())
 
 
 if __name__ == "__main__":

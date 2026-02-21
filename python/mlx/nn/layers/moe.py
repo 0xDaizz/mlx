@@ -205,65 +205,51 @@ def expert_dispatch(
         mx.eval(cap_arr)
         capacity = cap_arr.item()
 
-    # Build dispatch buffer: [world_size, experts_per_device, capacity, D]
-    dispatch_buffer = mx.zeros(
-        (world_size, experts_per_device, capacity, hidden_dim),
-        dtype=tokens.dtype,
-    )
+    total_slots = world_size * experts_per_device * capacity
+    slots_per_device = experts_per_device * capacity
+    dispatch_flat = mx.zeros((total_slots, hidden_dim), dtype=tokens.dtype)
 
-    # Compute positions using cumulative sum per expert
-    # For each (token, k) pair, determine which device and local expert slot
+    expert_range = mx.arange(num_experts)
     overflow_mask = mx.zeros((num_tokens, 1), dtype=mx.bool_)
-    positions = mx.full((num_tokens, top_k), -1, dtype=mx.int32)
-
-    # Track running count per expert across all top-k columns to avoid
-    # position collisions when a token is routed to the same expert by
-    # multiple top-k selections.
     expert_counts = mx.zeros((num_experts,), dtype=mx.int32)
+    pos_columns = []
+
+    zero_idx = mx.array(0, dtype=mx.int32)
+    neg_one = mx.array(-1, dtype=mx.int32)
+    zero_tokens = mx.zeros_like(tokens)
 
     for k in range(top_k):
-        indices_k = expert_indices[:, k]  # [N]
+        indices_k = expert_indices[:, k]
 
-        # Compute position within each expert's capacity buffer
-        for e in range(num_experts):
-            mask_e = (indices_k == e)  # [N] bool
-            # Offset cumsum by the running count for this expert
-            cum_pos = (
-                mx.cumsum(mask_e.astype(mx.int32), axis=0) - 1 + expert_counts[e]
-            )
-            # Only place tokens that fit within capacity
-            valid = mask_e & (cum_pos < capacity)
-            overflow_k = mask_e & (cum_pos >= capacity)
-            overflow_mask = overflow_mask | overflow_k.reshape(-1, 1)
+        one_hot = (indices_k.reshape(-1, 1) == expert_range.reshape(1, -1))
+        one_hot_int = one_hot.astype(mx.int32)
 
-            d = e // experts_per_device
-            le = e % experts_per_device
+        # Per-expert cumulative position, offset by counts from prior k columns
+        cum = mx.cumsum(one_hot_int, axis=0) - 1 + expert_counts.reshape(1, -1)
 
-            # Scatter tokens into dispatch buffer
-            # For valid tokens going to expert e:
-            valid_pos = mx.where(valid, cum_pos, mx.array(-1, dtype=mx.int32))
-            positions = mx.where(
-                (indices_k == e).reshape(-1, 1) & (mx.arange(top_k) == k).reshape(1, -1),
-                mx.broadcast_to(valid_pos.reshape(-1, 1), (num_tokens, top_k)),
-                positions,
-            )
+        pos = mx.take_along_axis(
+            cum, indices_k.reshape(-1, 1), axis=1
+        ).squeeze(1)
 
-            # Update running count for this expert
-            expert_counts = expert_counts.at[e].add(
-                mask_e.astype(mx.int32).sum()
-            )
+        valid = pos < capacity
+        overflow_mask = overflow_mask | (~valid).reshape(-1, 1)
 
-            # Evaluate once to get concrete values for the scatter loop
-            # This avoids per-iteration mx.eval() from bool(mx.array)
-            mx.eval(valid, cum_pos)
+        pos_columns.append(mx.where(valid, pos, neg_one))
 
-            # Scatter unweighted tokens (weights applied in expert_combine)
-            for n_idx in range(num_tokens):
-                if valid[n_idx].item():
-                    p = cum_pos[n_idx].item()
-                    dispatch_buffer = dispatch_buffer.at[d, le, p].add(
-                        tokens[n_idx]
-                    )
+        d = indices_k // experts_per_device
+        le = indices_k % experts_per_device
+        flat_idx = d * slots_per_device + le * capacity + pos
+        flat_idx = mx.where(valid, flat_idx, zero_idx).astype(mx.int32)
+        scatter_vals = mx.where(valid.reshape(-1, 1), tokens, zero_tokens)
+        dispatch_flat = dispatch_flat.at[flat_idx].add(scatter_vals)
+
+        expert_counts = expert_counts + one_hot_int.sum(axis=0)
+
+    positions = mx.stack(pos_columns, axis=1)
+
+    dispatch_buffer = dispatch_flat.reshape(
+        world_size, experts_per_device, capacity, hidden_dim
+    )
 
     meta = DispatchMeta(
         expert_indices=expert_indices,
@@ -329,32 +315,31 @@ def expert_combine(
     else:
         result_buffer = expert_outputs.reshape(1, experts_per_device, capacity, hidden_dim)
 
-    # Gather results back to original token positions
+    result_flat = result_buffer.reshape(-1, hidden_dim)
     combined = mx.zeros_like(original_tokens)
     top_k = meta.expert_indices.shape[1]
+    slots_per_device = experts_per_device * capacity
+    zero_idx = mx.array(0, dtype=mx.int32)
 
     for k in range(top_k):
         indices_k = meta.expert_indices[:, k]
         positions_k = meta.positions[:, k]
-        weights_k = meta.weights[:, k]  # [N] routing weights for k-th selection
+        weights_k = meta.weights[:, k]
         device_idx = indices_k // experts_per_device
         local_expert = indices_k % experts_per_device
 
-        # Evaluate once to get concrete values for the gather loop
-        mx.eval(positions_k, device_idx, local_expert)
+        flat_idx = (
+            device_idx * slots_per_device
+            + local_expert * capacity
+            + positions_k
+        )
+        valid = positions_k >= 0
+        flat_idx = mx.where(valid, flat_idx, zero_idx).astype(mx.int32)
 
-        for n_idx in range(num_tokens):
-            pos = positions_k[n_idx].item()
-            if pos >= 0:
-                d = device_idx[n_idx].item()
-                le = local_expert[n_idx].item()
-                combined = combined.at[n_idx].add(
-                    weights_k[n_idx] * result_buffer[d, le, pos]
-                )
+        gathered = result_flat[flat_idx]
+        safe_gathered = mx.where(valid.reshape(-1, 1), gathered, mx.zeros_like(gathered))
+        combined = combined + weights_k.reshape(-1, 1) * safe_gathered
 
-    # Apply overflow residual
-    # Only fall back to residual for tokens where no route was valid.
-    # overflow_mask is retained in DispatchMeta for diagnostics/logging.
     has_valid_route = (meta.positions >= 0).any(axis=1, keepdims=True)
     combined = mx.where(has_valid_route, combined, original_tokens)
 
