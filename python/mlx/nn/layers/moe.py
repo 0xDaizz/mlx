@@ -103,6 +103,8 @@ class TopKRouter(Module):
             Scalar auxiliary loss.
         """
         num_tokens = probs.shape[0]
+        if num_tokens == 0:
+            return mx.zeros((), dtype=probs.dtype)
 
         # f_e: fraction of tokens routed to each expert
         # Create one-hot and sum across top_k selections
@@ -351,7 +353,10 @@ def expert_combine(
                 )
 
     # Apply overflow residual
-    combined = mx.where(meta.overflow_mask, original_tokens, combined)
+    # Only fall back to residual for tokens where no route was valid.
+    # overflow_mask is retained in DispatchMeta for diagnostics/logging.
+    has_valid_route = (meta.positions >= 0).any(axis=1, keepdims=True)
+    combined = mx.where(has_valid_route, combined, original_tokens)
 
     return combined
 

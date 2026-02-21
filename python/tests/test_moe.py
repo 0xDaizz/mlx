@@ -14,6 +14,8 @@ from mlx.nn.layers.moe import (
     Expert,
     MixtureOfExperts,
     _compute_capacity,
+    expert_combine,
+    DispatchMeta,
 )
 
 
@@ -110,6 +112,17 @@ class TestTopKRouter(mlx_tests.MLXTestCase):
             TopKRouter(64, 8, top_k=0)
         with self.assertRaises(ValueError):
             TopKRouter(64, 8, top_k=9)
+
+    def test_empty_batch(self):
+        """Router should handle zero-token input without NaN."""
+        router = TopKRouter(64, 8, top_k=2)
+        x = mx.zeros((0, 64))
+        weights, indices, aux_loss = router(x)
+        mx.eval(weights, indices, aux_loss)
+        self.assertEqual(weights.shape, (0, 2))
+        self.assertEqual(indices.shape, (0, 2))
+        self.assertTrue(mx.isfinite(aux_loss).item())
+        self.assertEqual(aux_loss.item(), 0.0)
 
 
 class TestExpert(mlx_tests.MLXTestCase):
@@ -274,6 +287,49 @@ class TestMixtureOfExperts(mlx_tests.MLXTestCase):
         mx.eval(output, aux_loss)
 
         self.assertEqual(output.shape, (128, hidden_dim))
+
+    def test_partial_overflow_preserves_valid_routes(self):
+        """Tokens with at least one valid route should not be replaced by residual."""
+        hidden_dim = 4
+        num_experts = 2
+        capacity = 1
+        top_k = 2
+
+        # token0: expert 0 valid (pos=0), expert 1 overflow (pos=-1)
+        # token1: both routes overflow (pos=-1, -1)
+        positions = mx.array([[0, -1], [-1, -1]], dtype=mx.int32)
+        expert_indices = mx.array([[0, 1], [0, 1]], dtype=mx.int32)
+        weights = mx.array([[0.6, 0.4], [0.5, 0.5]])
+        overflow_mask = mx.array([[True], [True]])
+
+        meta = DispatchMeta(
+            expert_indices=expert_indices,
+            weights=weights,
+            positions=positions,
+            overflow_mask=overflow_mask,
+            num_experts=num_experts,
+            capacity=capacity,
+            world_size=1,
+        )
+
+        # expert_outputs: [num_experts, capacity, hidden_dim]
+        expert_outputs = mx.ones((num_experts, capacity, hidden_dim)) * 10.0
+        original_tokens = mx.zeros((2, hidden_dim))
+
+        combined = expert_combine(expert_outputs, meta, original_tokens)
+        mx.eval(combined)
+
+        # Verify bug reproduction condition: token0 has overflow_mask=True
+        # but should still use expert output because it has a valid route.
+        self.assertTrue(meta.overflow_mask[0].item())
+        has_valid = (meta.positions[0] >= 0).any().item()
+        self.assertTrue(has_valid)
+
+        # token0: weight=0.6 * expert_output=10.0 → expected 6.0 per dim
+        expected_token0 = mx.full((hidden_dim,), 0.6 * 10.0)
+        self.assertTrue(mx.allclose(combined[0], expected_token0).item())
+        # token1: all overflow → should be original (zeros)
+        self.assertTrue(mx.array_equal(combined[1], original_tokens[1]).item())
 
 
 if __name__ == "__main__":
