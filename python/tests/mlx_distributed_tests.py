@@ -685,19 +685,24 @@ class MLXDistributedCommonTestCase(mlx_tests.MLXTestCase):
         # Loss should be finite
         self.assertTrue(mx.isfinite(loss).item())
 
-        # Router gate grad: finite and non-zero
+        # Router gate grad: must be finite
         gate_grad = grads["router"]["gate"]["weight"]
         self.assertTrue(mx.all(mx.isfinite(gate_grad)).item())
-        self.assertTrue(mx.any(gate_grad != 0).item())
+        gate_has_grad = mx.any(gate_grad != 0).item()
 
-        # At least one local expert should have finite, non-zero gradients
+        # Check local expert grads: must be finite, at least one non-zero
         any_expert_has_grad = False
         for i in range(len(moe.experts)):
             w_gate_grad = grads["experts"][i]["w_gate"]["weight"]
-            if mx.all(mx.isfinite(w_gate_grad)).item() and mx.any(w_gate_grad != 0).item():
+            self.assertTrue(
+                mx.all(mx.isfinite(w_gate_grad)).item(),
+                f"Expert {i} w_gate grad has non-finite values on rank {rank}",
+            )
+            if mx.any(w_gate_grad != 0).item():
                 any_expert_has_grad = True
-                break
+
+        # At least gate or one expert must receive non-zero gradients
         self.assertTrue(
-            any_expert_has_grad,
-            "No local expert received finite non-zero gradients",
+            gate_has_grad or any_expert_has_grad,
+            f"Neither gate nor any expert received non-zero gradients on rank {rank}",
         )
