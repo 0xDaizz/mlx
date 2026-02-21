@@ -6,6 +6,12 @@ import mlx_tests
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 from mlx.nn.utils import average_gradients
 
+from mlx.nn.layers.moe import (
+    MixtureOfExperts,
+    expert_dispatch,
+    expert_combine,
+)
+
 
 class MLXDistributedCommonTestCase(mlx_tests.MLXTestCase):
     def test_average_gradients(self):
@@ -460,3 +466,238 @@ class MLXDistributedCommonTestCase(mlx_tests.MLXTestCase):
             y = mx.distributed.all_gather(x)
             self.assertEqual(y.shape, (world.size() * 2, 2, 4))
             self.assertTrue(mx.all(y == 1))
+
+    def test_moe_ep_forward(self):
+        group = mx.distributed.init()
+        self._skip_if_all_to_all_unsupported(group)
+        if group.size() != 2:
+            self.skipTest("MoE EP tests require exactly 2 devices")
+
+        world_size = group.size()
+        rank = group.rank()
+
+        mx.random.seed(42)
+        hidden_dim = 16
+        expert_dim = 32
+        num_experts = 4
+        top_k = 2
+        num_tokens = 8
+
+        moe = MixtureOfExperts(
+            hidden_dim=hidden_dim,
+            expert_dim=expert_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            capacity_factor=2.0,
+        )
+        mx.eval(moe.parameters())
+
+        x = mx.random.normal((num_tokens, hidden_dim)) + rank * 1000
+        output, aux_loss = moe(x)
+        mx.eval(output, aux_loss)
+
+        # Shape check
+        self.assertEqual(output.shape, (num_tokens, hidden_dim))
+        # Finiteness check
+        self.assertTrue(mx.all(mx.isfinite(output)).item())
+        self.assertTrue(mx.isfinite(aux_loss).item())
+        # EP enabled check
+        self.assertEqual(moe._world_size, world_size)
+        # Local expert count
+        self.assertEqual(len(moe.experts), num_experts // world_size)
+
+    def test_moe_ep_uneven_batch(self):
+        group = mx.distributed.init()
+        self._skip_if_all_to_all_unsupported(group)
+        if group.size() != 2:
+            self.skipTest("MoE EP tests require exactly 2 devices")
+
+        rank = group.rank()
+
+        mx.random.seed(42)
+        hidden_dim = 16
+        expert_dim = 32
+        num_experts = 4
+        top_k = 2
+
+        moe = MixtureOfExperts(
+            hidden_dim=hidden_dim,
+            expert_dim=expert_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            capacity_factor=2.0,
+        )
+        mx.eval(moe.parameters())
+
+        if rank == 0:
+            x = mx.random.normal((4, hidden_dim)) + rank * 1000
+        else:
+            x = mx.zeros((0, hidden_dim))
+
+        output, aux_loss = moe(x)
+        mx.eval(output, aux_loss)
+
+        if rank == 0:
+            self.assertEqual(output.shape, (4, hidden_dim))
+            self.assertTrue(mx.all(mx.isfinite(output)).item())
+        else:
+            # Empty rank checks
+            self.assertEqual(output.shape, (0, hidden_dim))
+            self.assertTrue(mx.all(mx.isfinite(output)).item())
+            self.assertEqual(aux_loss.item(), 0.0)
+
+    def test_moe_ep_dispatch_combine_roundtrip(self):
+        group = mx.distributed.init()
+        self._skip_if_all_to_all_unsupported(group)
+        if group.size() != 2:
+            self.skipTest("MoE EP tests require exactly 2 devices")
+
+        rank = group.rank()
+        hidden_dim = 8
+        num_tokens = 4
+        num_experts = 4
+        top_k = 1
+        capacity_factor = 2.0
+
+        # Rank-distinct input
+        x = (mx.arange(num_tokens).reshape(-1, 1) + 1 + rank * 1000).astype(mx.float32)
+        x = mx.broadcast_to(x, (num_tokens, hidden_dim))
+        x = mx.array(x)  # make contiguous
+
+        # Build routing: half local, half remote
+        expert_indices = mx.zeros((num_tokens, top_k), dtype=mx.int32)
+        for i in range(num_tokens):
+            if i < num_tokens // 2:
+                # Local expert
+                expert_indices = expert_indices.at[i, 0].add(rank * 2 + i % 2)
+            else:
+                # Remote expert
+                expert_indices = expert_indices.at[i, 0].add((1 - rank) * 2 + i % 2)
+
+        weights = mx.ones((num_tokens, top_k), dtype=mx.float32)
+
+        dispatched, meta = expert_dispatch(
+            x, expert_indices, weights,
+            num_experts=num_experts,
+            capacity_factor=capacity_factor,
+            group=group,
+        )
+        mx.eval(dispatched)
+
+        # Identity: just pass through
+        combined = expert_combine(dispatched, meta, x, group=group)
+        mx.eval(combined)
+
+        # Check valid-route tokens round-trip correctly
+        has_valid = (meta.positions >= 0).any(axis=1)
+        mx.eval(has_valid)
+        for i in range(num_tokens):
+            if has_valid[i].item():
+                self.assertTrue(
+                    mx.allclose(combined[i], x[i], atol=1e-5, rtol=1e-4).item(),
+                    f"Token {i} on rank {rank} did not round-trip correctly",
+                )
+
+    def test_moe_ep_partial_overflow(self):
+        group = mx.distributed.init()
+        self._skip_if_all_to_all_unsupported(group)
+        if group.size() != 2:
+            self.skipTest("MoE EP tests require exactly 2 devices")
+
+        rank = group.rank()
+        hidden_dim = 8
+        num_tokens = 4
+        num_experts = 4
+        top_k = 2
+        capacity_factor = 0.5  # Force overflow
+
+        # Rank-distinct input
+        x = mx.ones((num_tokens, hidden_dim), dtype=mx.float32) * (rank + 1.0) * 100
+
+        # Route all tokens to experts 0 and 1 -> overflow with low capacity
+        expert_indices = mx.zeros((num_tokens, top_k), dtype=mx.int32)
+        expert_indices = expert_indices.at[:, 1].add(1)  # k=0 -> expert 0, k=1 -> expert 1
+        weights = mx.ones((num_tokens, top_k), dtype=mx.float32) * 0.5
+
+        dispatched, meta = expert_dispatch(
+            x, expert_indices, weights,
+            num_experts=num_experts,
+            capacity_factor=capacity_factor,
+            group=group,
+        )
+        mx.eval(dispatched)
+
+        combined = expert_combine(dispatched, meta, x, group=group)
+        mx.eval(combined)
+
+        has_valid_route = (meta.positions >= 0).any(axis=1)
+        mx.eval(has_valid_route)
+
+        for i in range(num_tokens):
+            if has_valid_route[i].item():
+                # Valid route tokens should be finite
+                self.assertTrue(
+                    mx.all(mx.isfinite(combined[i])).item(),
+                    f"Token {i} on rank {rank} has non-finite values",
+                )
+            else:
+                # Overflow tokens should fall back to residual (original input)
+                self.assertTrue(
+                    mx.array_equal(combined[i], x[i]).item(),
+                    f"Overflow token {i} on rank {rank} did not use residual",
+                )
+
+    def test_moe_ep_gradient(self):
+        group = mx.distributed.init()
+        self._skip_if_all_to_all_unsupported(group)
+        if group.size() != 2:
+            self.skipTest("MoE EP tests require exactly 2 devices")
+
+        rank = group.rank()
+
+        mx.random.seed(42)
+        hidden_dim = 16
+        expert_dim = 32
+        num_experts = 4
+        top_k = 2
+        num_tokens = 8
+
+        moe = MixtureOfExperts(
+            hidden_dim=hidden_dim,
+            expert_dim=expert_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            capacity_factor=2.0,
+            aux_loss_coeff=0.0,  # Exclude aux_loss to test all_to_all VJP path
+        )
+        mx.eval(moe.parameters())
+
+        x = mx.random.normal((num_tokens, hidden_dim)) + rank * 1000
+
+        def loss_fn(model, x):
+            output, _aux = model(x)
+            return output.sum()
+
+        loss_and_grad = nn.value_and_grad(moe, loss_fn)
+        loss, grads = loss_and_grad(moe, x)
+        mx.eval(loss, grads)
+
+        # Loss should be finite
+        self.assertTrue(mx.isfinite(loss).item())
+
+        # Router gate grad: finite and non-zero
+        gate_grad = grads["router"]["gate"]["weight"]
+        self.assertTrue(mx.all(mx.isfinite(gate_grad)).item())
+        self.assertTrue(mx.any(gate_grad != 0).item())
+
+        # At least one local expert should have finite, non-zero gradients
+        any_expert_has_grad = False
+        for i in range(len(moe.experts)):
+            w_gate_grad = grads["experts"][i]["w_gate"]["weight"]
+            if mx.all(mx.isfinite(w_gate_grad)).item() and mx.any(w_gate_grad != 0).item():
+                any_expert_has_grad = True
+                break
+        self.assertTrue(
+            any_expert_has_grad,
+            "No local expert received finite non-zero gradients",
+        )
