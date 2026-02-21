@@ -104,6 +104,13 @@ class TestTopKRouter(mlx_tests.MLXTestCase):
         self.assertEqual(weights.shape, (1, top_k))
         self.assertEqual(indices.shape, (1, top_k))
 
+    def test_top_k_validation(self):
+        """Should raise error for invalid top_k."""
+        with self.assertRaises(ValueError):
+            TopKRouter(64, 8, top_k=0)
+        with self.assertRaises(ValueError):
+            TopKRouter(64, 8, top_k=9)
+
 
 class TestExpert(mlx_tests.MLXTestCase):
     def test_output_shape(self):
@@ -220,9 +227,13 @@ class TestMixtureOfExperts(mlx_tests.MLXTestCase):
         self.assertEqual(len(params["experts"]), num_experts)
 
     def test_validation_error(self):
-        """Should raise error for invalid num_experts."""
+        """Should raise error for invalid num_experts or top_k."""
         with self.assertRaises(Exception):
             MixtureOfExperts(64, 128, 0)
+        with self.assertRaises(ValueError):
+            MixtureOfExperts(64, 128, 4, top_k=0)
+        with self.assertRaises(ValueError):
+            MixtureOfExperts(64, 128, 4, top_k=5)
 
     def test_different_top_k(self):
         """MoE should work with different top_k values."""

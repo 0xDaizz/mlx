@@ -42,6 +42,11 @@ class TopKRouter(Module):
         aux_loss_coeff: float = 0.01,
     ):
         super().__init__()
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}")
+        if top_k > num_experts:
+            raise ValueError(
+                f"top_k ({top_k}) must not exceed num_experts ({num_experts})")
         self.gate = Linear(hidden_dim, num_experts, bias=False)
         self.num_experts = num_experts
         self.top_k = top_k
@@ -188,6 +193,15 @@ def expert_dispatch(
         )
     experts_per_device = num_experts // world_size
     capacity = _compute_capacity(num_tokens, top_k, capacity_factor, num_experts)
+
+    # In distributed mode, synchronize capacity across ranks so all ranks
+    # use the same buffer size for all_to_all. Different ranks may have
+    # different token counts (e.g. uneven last batch).
+    if world_size > 1 and group is not None:
+        cap_arr = mx.array(capacity, dtype=mx.int32)
+        cap_arr = mx.distributed.all_max(cap_arr, group=group)
+        mx.eval(cap_arr)
+        capacity = cap_arr.item()
 
     # Build dispatch buffer: [world_size, experts_per_device, capacity, D]
     dispatch_buffer = mx.zeros(
@@ -367,6 +381,11 @@ class MixtureOfExperts(Module):
 
         if num_experts <= 0:
             raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}")
+        if top_k > num_experts:
+            raise ValueError(
+                f"top_k ({top_k}) must not exceed num_experts ({num_experts})")
 
         # Determine distributed context
         self._world_size = 1
