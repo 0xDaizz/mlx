@@ -489,6 +489,22 @@ class TestCppMoeExchange(unittest.TestCase):
         # Skip if C++ primitive not available
         if not hasattr(mx.distributed, "moe_dispatch_exchange"):
             self.skipTest("moe_dispatch_exchange not available")
+        # Detect actual world_size: try each backend explicitly so that
+        # mlx.launch-initialized backends (JACCL/MPI) are detected correctly.
+        self._world_size = 1
+        for backend in ("jaccl", "mpi", "nccl"):
+            try:
+                g = mx.distributed.init(strict=True, backend=backend)
+                if g.size() > 1:
+                    self._world_size = g.size()
+                    break
+            except Exception:
+                pass
+        if self._world_size == 1:
+            try:
+                self._world_size = mx.distributed.init().size()
+            except Exception:
+                self._world_size = 1
 
     def _python_dispatch_combine_ref(self, tokens, expert_indices, weights,
                                       num_experts, capacity):
@@ -539,6 +555,8 @@ class TestCppMoeExchange(unittest.TestCase):
 
     def test_dispatch_local_basic(self):
         """Local dispatch matches reference for simple case."""
+        if self._world_size > 1:
+            self.skipTest("local-only test")
         mx.random.seed(42)
         N, D, E, top_k = 8, 16, 4, 2
         capacity = 4
@@ -593,6 +611,8 @@ class TestCppMoeExchange(unittest.TestCase):
 
     def test_overflow_residual_fallback(self):
         """Tokens with all-overflow routes get original_tokens as residual."""
+        if self._world_size > 1:
+            self.skipTest("local-only test")
         N, D, E, top_k = 4, 8, 1, 2
         capacity = 1  # only 1 slot for the single expert
 
@@ -631,6 +651,8 @@ class TestCppMoeExchange(unittest.TestCase):
 
     def test_empty_batch(self):
         """N=0 (empty batch) should produce empty outputs."""
+        if self._world_size > 1:
+            self.skipTest("local-only test")
         E, D, top_k = 4, 16, 2
         capacity = 4
 
@@ -700,6 +722,8 @@ class TestCppMoeExchange(unittest.TestCase):
 
     def test_cpp_vs_python_consistency(self):
         """C++ primitive matches Python expert_dispatch/combine for local mode."""
+        if self._world_size > 1:
+            self.skipTest("local-only test")
         mx.random.seed(123)
         N, D, E, top_k = 12, 8, 4, 2
         capacity_factor = 1.5
