@@ -18,6 +18,8 @@ made available.
     all_sum
     all_gather
     all_to_all
+    moe_dispatch_exchange
+    moe_combine_exchange
     send
     recv
     recv_like

@@ -45,6 +45,10 @@ class MeshGroup : public GroupImpl {
   void send(const array& input, int dst, Stream stream) override;
   void recv(array& out, int src, Stream stream) override;
 
+  void blocking_send(const array& input, int dst) override;
+  void blocking_recv(array& out, int src) override;
+  void blocking_all_to_all(const array& input, array& output) override;
+
   void sum_scatter(const array& input, array& output, Stream stream) override {
     throw std::runtime_error("[jaccl] sum_scatter not supported.");
   }

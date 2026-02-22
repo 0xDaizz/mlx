@@ -234,9 +234,17 @@ std::pair<array, array> moe_dispatch_exchange(
     throw std::invalid_argument(
         "[moe_dispatch_exchange] tokens and expert_indices must have same N.");
   }
+  if (expert_indices.dtype() != int32) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] expert_indices must have dtype int32.");
+  }
   if (num_experts % group.size() != 0) {
     throw std::invalid_argument(
         "[moe_dispatch_exchange] num_experts must be divisible by group size.");
+  }
+  if (capacity <= 0) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] capacity must be positive.");
   }
 
   int world_size = group.size();
@@ -305,6 +313,38 @@ array moe_combine_exchange(
         "[moe_combine_exchange] weights must have dtype float32.");
   }
 
+  // Shape compatibility checks
+  if (route_indices.shape(0) != weights.shape(0) ||
+      route_indices.shape(0) != original_tokens.shape(0)) {
+    std::ostringstream msg;
+    msg << "[moe_combine_exchange] N dimension mismatch: "
+        << "route_indices.shape(0)=" << route_indices.shape(0)
+        << " weights.shape(0)=" << weights.shape(0)
+        << " original_tokens.shape(0)=" << original_tokens.shape(0);
+    throw std::invalid_argument(msg.str());
+  }
+  if (route_indices.shape(1) != weights.shape(1)) {
+    std::ostringstream msg;
+    msg << "[moe_combine_exchange] top_k dimension mismatch: "
+        << "route_indices.shape(1)=" << route_indices.shape(1)
+        << " weights.shape(1)=" << weights.shape(1);
+    throw std::invalid_argument(msg.str());
+  }
+  if (original_tokens.shape(1) != expert_outputs.shape(2)) {
+    std::ostringstream msg;
+    msg << "[moe_combine_exchange] hidden dim D mismatch: "
+        << "original_tokens.shape(1)=" << original_tokens.shape(1)
+        << " expert_outputs.shape(2)=" << expert_outputs.shape(2);
+    throw std::invalid_argument(msg.str());
+  }
+  if (original_tokens.dtype() != expert_outputs.dtype()) {
+    std::ostringstream msg;
+    msg << "[moe_combine_exchange] dtype mismatch: "
+        << "original_tokens.dtype=" << original_tokens.dtype()
+        << " expert_outputs.dtype=" << expert_outputs.dtype();
+    throw std::invalid_argument(msg.str());
+  }
+
   int world_size = group.size();
   if (expert_outputs.shape(1) != world_size * capacity) {
     std::ostringstream msg;
@@ -313,6 +353,10 @@ array moe_combine_exchange(
         << " must equal world_size * capacity = " << world_size << " * "
         << capacity << " = " << (world_size * capacity) << ".";
     throw std::invalid_argument(msg.str());
+  }
+  if (capacity <= 0) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] capacity must be positive.");
   }
 
   int N = original_tokens.shape(0);

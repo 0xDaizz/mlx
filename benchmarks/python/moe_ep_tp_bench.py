@@ -9,6 +9,7 @@ Requires exactly 2 devices. Run with:
 """
 
 import argparse
+import math
 import subprocess
 import time
 
@@ -109,6 +110,10 @@ def main():
 
     ep_a2a_med, ep_a2a_p90 = time_fn(ep_a2a, warmup, iters)
 
+    # Capacity used by expert_dispatch and C++ fused path
+    capacity = math.ceil(N * top_k / E * cf)
+    E_local = E // group.size()
+
     # 3. EP dispatch + combine
     barrier(group)
 
@@ -126,6 +131,47 @@ def main():
         return combined
 
     ep_dc_med, ep_dc_p90 = time_fn(ep_dc, warmup, iters)
+
+    # 4b. Phase 1 C++ ref: all_to_all(fixed dispatch buf) x2
+    # Pre-allocate the full dispatch buffer (same shape Phase 1 C++ would send).
+    # This approximates Phase 1 C++ communication cost without Python routing overhead.
+    send_buf_ref = mx.zeros(
+        (group.size(), E_local * capacity * D), dtype=mx.float32
+    )
+    mx.eval(send_buf_ref)
+
+    barrier(group)
+
+    def ep_a2a_ref():
+        y = mx.distributed.all_to_all(send_buf_ref, group=group)
+        z = mx.distributed.all_to_all(y, group=group)
+        return z
+
+    ep_p1ref_med, ep_p1ref_p90 = time_fn(ep_a2a_ref, warmup, iters)
+
+    # 5. EP dispatch + combine (C++ fused, Phase 2)
+    barrier(group)
+    has_cpp = hasattr(mx.distributed, "moe_dispatch_exchange")
+
+    if has_cpp:
+        def ep_dc_cpp():
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens, expert_indices,
+                num_experts=E, capacity=capacity,
+                group=group,
+            )
+            route_idx = mx.stop_gradient(route_idx)
+            # Identity expert (no computation)
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched, route_idx, weights, tokens,
+                num_experts=E, capacity=capacity,
+                group=group,
+            )
+            return combined
+
+        ep_dc_cpp_med, ep_dc_cpp_p90 = time_fn(ep_dc_cpp, warmup, iters)
+    else:
+        ep_dc_cpp_med, ep_dc_cpp_p90 = float('nan'), float('nan')
 
     # 4. Dense MLP (local, single device)
     barrier(group)
@@ -153,11 +199,26 @@ def main():
         tp_est_ms = tp_med + tp_compute_ms
         ep_est_ms = ep_dc_med + ep_compute_ms
 
-        print(f"[EP vs TP] commit={commit} N={N} D={D} E={E} top_k={top_k}")
+        print(f"[EP vs TP] commit={commit} N={N} D={D} E={E} top_k={top_k} cap={capacity}")
         print(f"  tp_all_sum:   median={tp_med:.2f}ms  p90={tp_p90:.2f}ms")
         print(f"  ep_a2a_x2:    median={ep_a2a_med:.2f}ms  p90={ep_a2a_p90:.2f}ms")
-        print(f"  ep_d+c:       median={ep_dc_med:.2f}ms  p90={ep_dc_p90:.2f}ms")
-        print(f"  dense_mlp:    median={mlp_med:.2f}ms  p90={mlp_p90:.2f}ms")
+        print(f"  ep_d+c_py:        median={ep_dc_med:.2f}ms  p90={ep_dc_p90:.2f}ms")
+        print(f"  ep_d+c_cpp_p1ref: median={ep_p1ref_med:.2f}ms  p90={ep_p1ref_p90:.2f}ms")
+        print(f"  ep_d+c_cpp_p2:    median={ep_dc_cpp_med:.2f}ms  p90={ep_dc_cpp_p90:.2f}ms")
+        if has_cpp:
+            p2_vs_p1ref = ep_p1ref_med / max(ep_dc_cpp_med, 1e-6)
+            p2_vs_py = ep_dc_med / max(ep_dc_cpp_med, 1e-6)
+            # Estimate communication bytes
+            fixed_bytes = E_local * capacity * D * 4  # float32, Phase 1 fixed a2a
+            est_remote_tokens = N * top_k // group.size()  # uniform routing estimate
+            var_bytes = est_remote_tokens * D * 4          # payload
+            var_bytes += est_remote_tokens * 2 * 4         # meta (2 x int32)
+            print(f"  p2_vs_p1ref:      {p2_vs_p1ref:.2f}x speedup over Phase 1 C++ ref")
+            print(f"  p2_vs_py:         {p2_vs_py:.2f}x speedup over Python")
+            print(f"  comm_fixed_a2a:   {fixed_bytes/1024:.1f}KB/dir (Phase 1 fixed)")
+            print(f"  comm_var_est:     {var_bytes/1024:.1f}KB/dir (Phase 2 est, uniform routing)")
+            print(f"  comm_savings_est: {(1 - var_bytes/fixed_bytes)*100:.0f}% (estimated)")
+        print(f"  dense_mlp:        median={mlp_med:.2f}ms  p90={mlp_p90:.2f}ms")
         print(f"  ---")
         comm_ratio = ep_a2a_med / max(tp_med, 1e-6)
         speedup = tp_est_ms / max(ep_est_ms, 1e-6)

@@ -31,6 +31,24 @@ class GroupImpl {
   virtual void
   sum_scatter(const array& input, array& output, Stream stream) = 0;
   virtual void all_to_all(const array& input, array& output, Stream stream) = 0;
+
+  // Blocking (synchronous) communication — runs directly on the calling
+  // thread without going through the encoder/stream machinery.
+  // Subclasses that support MoeDispatchExchange / MoeCombineExchange must
+  // override these.  Default implementation throws so that unsupported
+  // backends fail loudly.
+  virtual void blocking_send(const array& input, int dst) {
+    throw std::runtime_error(
+        "[GroupImpl] blocking_send not supported by this backend");
+  }
+  virtual void blocking_recv(array& output, int src) {
+    throw std::runtime_error(
+        "[GroupImpl] blocking_recv not supported by this backend");
+  }
+  virtual void blocking_all_to_all(const array& input, array& output) {
+    throw std::runtime_error(
+        "[GroupImpl] blocking_all_to_all not supported by this backend");
+  }
 };
 
 /* Define the MLX stream that the communication should happen in. */

@@ -488,6 +488,40 @@ class MPIGroup : public GroupImpl {
         output.data<void>(), count, mpi().datatype(output), comm_);
   }
 
+  void blocking_send(const array& input, int dst) override {
+    mpi().send(
+        input.data<void>(),
+        input.size(),
+        mpi().datatype(input),
+        dst,
+        0,
+        comm_);
+  }
+
+  void blocking_recv(array& out, int src) override {
+    MPI_Status status;
+    mpi().recv(
+        out.data<void>(),
+        out.size(),
+        mpi().datatype(out),
+        src,
+        MPI_ANY_TAG,
+        comm_,
+        &status);
+  }
+
+  void blocking_all_to_all(const array& input, array& output) override {
+    int count = input.size() / size();
+    mpi().all_to_all(
+        input.data<void>(),
+        count,
+        mpi().datatype(input),
+        output.data<void>(),
+        count,
+        mpi().datatype(output),
+        comm_);
+  }
+
  private:
   MPI_Comm comm_;
   bool global_;

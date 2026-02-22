@@ -476,10 +476,11 @@ class MixtureOfExperts(Module):
             )
             route_idx = mx.stop_gradient(route_idx)
             expert_out = self._run_local_experts(dispatched)
+            weights_f32 = weights.astype(mx.float32)
             output = mx.distributed.moe_combine_exchange(
                 expert_out,
                 route_idx,
-                weights,
+                weights_f32,
                 x,
                 num_experts=self.num_experts,
                 capacity=capacity,
