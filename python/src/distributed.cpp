@@ -379,4 +379,120 @@ void init_distributed(nb::module_& parent_module) {
       Returns:
         array: The result of the all-to-all exchange.
     )pbdoc");
+
+  m.def(
+      "moe_dispatch_exchange",
+      [](const ScalarOrArray& tokens,
+         const ScalarOrArray& expert_indices,
+         int num_experts,
+         int capacity,
+         std::optional<mx::distributed::Group> group,
+         bool deterministic,
+         mx::StreamOrDevice s) {
+        auto [dispatched, route_idx] = mx::distributed::moe_dispatch_exchange(
+            to_array(tokens),
+            to_array(expert_indices),
+            num_experts,
+            capacity,
+            group,
+            deterministic,
+            s);
+        return nb::make_tuple(dispatched, route_idx);
+      },
+      "tokens"_a,
+      "expert_indices"_a,
+      nb::kw_only(),
+      "num_experts"_a,
+      "capacity"_a,
+      "group"_a = nb::none(),
+      "deterministic"_a = true,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def moe_dispatch_exchange(tokens: array, expert_indices: array, "
+          "*, num_experts: int, capacity: int, group: Optional[Group] = None, "
+          "deterministic: bool = True, "
+          "stream: Union[None, Stream, Device] = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Fused MoE dispatch and all-to-all exchange.
+
+        Scatters tokens into the dispatch buffer and performs all-to-all
+        exchange in a single fused primitive.
+
+        Args:
+          tokens (array): Input tokens of shape ``[N, D]``.
+          expert_indices (array): Expert assignments of shape ``[N, top_k]`` (int32).
+          num_experts (int): Total number of experts across all devices.
+          capacity (int): Per-expert capacity (max tokens per expert).
+          group (Group, optional): Distributed group. Default: global group.
+          deterministic (bool, optional): Use token-order based slot assignment.
+            Default: ``True``.
+          stream (Stream, optional): Stream or device. Default: ``None``.
+
+        Returns:
+          tuple[array, array]: ``(dispatched, route_indices)`` where
+            - ``dispatched``: ``[experts_per_device, world_size * capacity, D]``
+            - ``route_indices``: ``[N, top_k]`` int32, -1 means overflow
+      )pbdoc");
+
+  m.def(
+      "moe_combine_exchange",
+      [](const ScalarOrArray& expert_outputs,
+         const ScalarOrArray& route_indices,
+         const ScalarOrArray& weights,
+         const ScalarOrArray& original_tokens,
+         int num_experts,
+         int capacity,
+         std::optional<mx::distributed::Group> group,
+         bool deterministic,
+         mx::StreamOrDevice s) {
+        return mx::distributed::moe_combine_exchange(
+            to_array(expert_outputs),
+            to_array(route_indices),
+            to_array(weights),
+            to_array(original_tokens),
+            num_experts,
+            capacity,
+            group,
+            deterministic,
+            s);
+      },
+      "expert_outputs"_a,
+      "route_indices"_a,
+      "weights"_a,
+      "original_tokens"_a,
+      nb::kw_only(),
+      "num_experts"_a,
+      "capacity"_a,
+      "group"_a = nb::none(),
+      "deterministic"_a = true,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def moe_combine_exchange(expert_outputs: array, route_indices: array, "
+          "weights: array, original_tokens: array, "
+          "*, num_experts: int, capacity: int, group: Optional[Group] = None, "
+          "deterministic: bool = True, "
+          "stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused MoE all-to-all exchange and combine.
+
+        Performs all-to-all exchange and gathers expert outputs back to token
+        order with weighted summation in a single fused primitive.
+
+        Args:
+          expert_outputs (array): Expert outputs of shape
+            ``[experts_per_device, world_size * capacity, D]``.
+          route_indices (array): Route indices from ``moe_dispatch_exchange``,
+            shape ``[N, top_k]`` int32.
+          weights (array): Routing weights, shape ``[N, top_k]``.
+          original_tokens (array): Original input tokens ``[N, D]`` used as
+            residual fallback for fully-overflowed tokens.
+          num_experts (int): Total number of experts across all devices.
+          capacity (int): Per-expert capacity.
+          group (Group, optional): Distributed group. Default: global group.
+          deterministic (bool, optional): Default: ``True``.
+          stream (Stream, optional): Stream or device. Default: ``None``.
+
+        Returns:
+          array: Combined tokens of shape ``[N, D]``.
+      )pbdoc");
 }

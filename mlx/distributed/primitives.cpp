@@ -113,4 +113,24 @@ std::vector<array> AllToAll::vjp(
   return {all_to_all(cotangents[0], group(), stream())};
 }
 
+std::vector<array> MoeDispatchExchange::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  throw std::runtime_error(
+      "[MoeDispatchExchange] VJP not implemented yet. "
+      "Use ep_impl='python' for training.");
+}
+
+std::vector<array> MoeCombineExchange::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  throw std::runtime_error(
+      "[MoeCombineExchange] VJP not implemented yet. "
+      "Use ep_impl='python' for training.");
+}
+
 } // namespace mlx::core::distributed

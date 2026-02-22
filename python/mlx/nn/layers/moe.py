@@ -358,6 +358,11 @@ class MixtureOfExperts(Module):
         top_k: Number of experts per token. Default: ``2``.
         capacity_factor: Capacity scaling factor. Default: ``1.25``.
         aux_loss_coeff: Load balance loss coefficient. Default: ``0.01``.
+        ep_impl: Expert parallelism implementation to use. One of ``"auto"``,
+            ``"python"``, or ``"cpp"``. ``"auto"`` uses the Python vectorized
+            path (until C++ VJP is available). ``"cpp"`` uses the fused C++
+            primitive (inference-only, no gradient support). ``"python"``
+            always uses the Python vectorized path. Default: ``"auto"``.
     """
 
     def __init__(
@@ -368,6 +373,7 @@ class MixtureOfExperts(Module):
         top_k: int = 2,
         capacity_factor: float = 1.25,
         aux_loss_coeff: float = 0.01,
+        ep_impl: str = "auto",
     ):
         super().__init__()
 
@@ -411,6 +417,7 @@ class MixtureOfExperts(Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.capacity_factor = capacity_factor
+        self.ep_impl = ep_impl
 
         # Router
         self.router = TopKRouter(
@@ -437,21 +444,59 @@ class MixtureOfExperts(Module):
         # Route
         weights, expert_indices, aux_loss = self.router(x)
 
-        # Dispatch
-        dispatched, meta = expert_dispatch(
-            x, expert_indices, weights,
-            self.num_experts, self.capacity_factor,
-            group=self._group,
+        # Determine implementation to use
+        # auto: always use Python (until VJP is implemented in Phase 3)
+        # cpp: use C++ primitive (inference-only, no grad support)
+        # python: always use Python vectorized path
+        use_cpp = (
+            self.ep_impl == "cpp"
+            and self._group is not None
+            and hasattr(mx.distributed, "moe_dispatch_exchange")
         )
 
-        # Run local experts
-        expert_outputs = self._run_local_experts(dispatched)
+        if use_cpp:
+            # C++ fused primitive path (inference-only)
+            capacity = _compute_capacity(
+                x.shape[0], self.router.top_k,
+                self.capacity_factor, self.num_experts
+            )
+            # Synchronize capacity across ranks
+            if self._world_size > 1:
+                cap_arr = mx.array(capacity, dtype=mx.int32)
+                cap_arr = mx.distributed.all_max(cap_arr, group=self._group)
+                mx.eval(cap_arr)
+                capacity = cap_arr.item()
 
-        # Combine
-        output = expert_combine(
-            expert_outputs, meta, x,
-            group=self._group,
-        )
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                x,
+                expert_indices.astype(mx.int32),
+                num_experts=self.num_experts,
+                capacity=capacity,
+                group=self._group,
+            )
+            route_idx = mx.stop_gradient(route_idx)
+            expert_out = self._run_local_experts(dispatched)
+            output = mx.distributed.moe_combine_exchange(
+                expert_out,
+                route_idx,
+                weights,
+                x,
+                num_experts=self.num_experts,
+                capacity=capacity,
+                group=self._group,
+            )
+        else:
+            # Python vectorized path (supports grad)
+            dispatched, meta = expert_dispatch(
+                x, expert_indices, weights,
+                self.num_experts, self.capacity_factor,
+                group=self._group,
+            )
+            expert_out = self._run_local_experts(dispatched)
+            output = expert_combine(
+                expert_out, meta, x,
+                group=self._group,
+            )
 
         return output, aux_loss
 

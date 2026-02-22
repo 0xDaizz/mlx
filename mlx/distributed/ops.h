@@ -59,4 +59,24 @@ MLX_API array all_to_all(
     std::optional<Group> group = std::nullopt,
     StreamOrDevice s = {});
 
+MLX_API std::pair<array, array> moe_dispatch_exchange(
+    const array& tokens,
+    const array& expert_indices,
+    int num_experts,
+    int capacity,
+    std::optional<Group> group = std::nullopt,
+    bool deterministic = true,
+    StreamOrDevice s = {});
+
+MLX_API array moe_combine_exchange(
+    const array& expert_outputs,
+    const array& route_indices,
+    const array& weights,
+    const array& original_tokens,
+    int num_experts,
+    int capacity,
+    std::optional<Group> group = std::nullopt,
+    bool deterministic = true,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::distributed

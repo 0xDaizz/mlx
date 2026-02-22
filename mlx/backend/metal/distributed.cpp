@@ -39,4 +39,20 @@ void AllToAll::eval_gpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("[AllToAll::eval_gpu] has no GPU implementation.");
 }
 
+void MoeDispatchExchange::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw std::runtime_error(
+      "[MoeDispatchExchange::eval_gpu] No GPU implementation yet. "
+      "Run on CPU stream.");
+}
+
+void MoeCombineExchange::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw std::runtime_error(
+      "[MoeCombineExchange::eval_gpu] No GPU implementation yet. "
+      "Run on CPU stream.");
+}
+
 } // namespace mlx::core::distributed

@@ -178,4 +178,76 @@ class AllToAll : public DistPrimitive {
 
   DEFINE_NAME(AllToAll);
 };
+
+class MoeDispatchExchange : public DistPrimitive {
+ public:
+  MoeDispatchExchange(
+      Stream stream,
+      Group group,
+      int num_experts,
+      int capacity,
+      bool deterministic)
+      : DistPrimitive(stream, group),
+        num_experts_(num_experts),
+        capacity_(capacity),
+        deterministic_(deterministic) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  DEFINE_NAME(MoeDispatchExchange);
+
+  int num_experts() const { return num_experts_; }
+  int capacity() const { return capacity_; }
+  bool deterministic() const { return deterministic_; }
+
+ private:
+  int num_experts_;
+  int capacity_;
+  bool deterministic_;
+};
+
+class MoeCombineExchange : public DistPrimitive {
+ public:
+  MoeCombineExchange(
+      Stream stream,
+      Group group,
+      int num_experts,
+      int capacity,
+      bool deterministic)
+      : DistPrimitive(stream, group),
+        num_experts_(num_experts),
+        capacity_(capacity),
+        deterministic_(deterministic) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  DEFINE_NAME(MoeCombineExchange);
+
+  int num_experts() const { return num_experts_; }
+  int capacity() const { return capacity_; }
+  bool deterministic() const { return deterministic_; }
+
+ private:
+  int num_experts_;
+  int capacity_;
+  bool deterministic_;
+};
 } // namespace mlx::core::distributed

@@ -181,6 +181,8 @@ NO_GPU_MULTI(Send)
 NO_GPU_MULTI(Recv)
 NO_GPU_MULTI(ReduceScatter)
 NO_GPU_MULTI(AllToAll)
+NO_GPU_MULTI(MoeDispatchExchange)
+NO_GPU_MULTI(MoeCombineExchange)
 } // namespace distributed
 
 } // namespace mlx::core

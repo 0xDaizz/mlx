@@ -210,4 +210,126 @@ array all_to_all(
       std::make_shared<AllToAll>(stream, group),
       {x});
 }
+
+std::pair<array, array> moe_dispatch_exchange(
+    const array& tokens,
+    const array& expert_indices,
+    int num_experts,
+    int capacity,
+    std::optional<Group> group_,
+    bool deterministic,
+    StreamOrDevice s) {
+  auto group = to_group(group_);
+
+  // Validate inputs
+  if (tokens.ndim() != 2) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] tokens must be 2-D [N, D].");
+  }
+  if (expert_indices.ndim() != 2) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] expert_indices must be 2-D [N, top_k].");
+  }
+  if (tokens.shape(0) != expert_indices.shape(0)) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] tokens and expert_indices must have same N.");
+  }
+  if (num_experts % group.size() != 0) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] num_experts must be divisible by group size.");
+  }
+
+  int world_size = group.size();
+  int experts_per_device = num_experts / world_size;
+  int cap_total = world_size * capacity;
+  int D = tokens.shape(1);
+  int N = tokens.shape(0);
+  int top_k = expert_indices.shape(1);
+
+  // Output shapes:
+  // dispatched: [experts_per_device, cap_total, D]
+  // route_indices: [N, top_k] int32
+  auto dispatched_shape = Shape{experts_per_device, cap_total, D};
+  auto route_indices_shape = Shape{N, top_k};
+
+  // Always use a CPU stream: eval_cpu handles all work; eval_gpu is not
+  // implemented. For multi-rank groups, detail::communication_stream already
+  // returns CPU (JACCL/MPI are CPU-based), but for singleton groups the
+  // EmptyGroup returns the default-device stream which can be GPU on Metal.
+  auto stream = to_stream(s, Device::cpu);
+
+  auto outputs = array::make_arrays(
+      {std::move(dispatched_shape), std::move(route_indices_shape)},
+      {tokens.dtype(), int32},
+      std::make_shared<MoeDispatchExchange>(
+          stream, group, num_experts, capacity, deterministic),
+      {tokens, expert_indices});
+
+  return {outputs[0], outputs[1]};
+}
+
+array moe_combine_exchange(
+    const array& expert_outputs,
+    const array& route_indices,
+    const array& weights,
+    const array& original_tokens,
+    int num_experts,
+    int capacity,
+    std::optional<Group> group_,
+    bool deterministic,
+    StreamOrDevice s) {
+  auto group = to_group(group_);
+
+  if (expert_outputs.ndim() != 3) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] expert_outputs must be 3-D [E_local, cap_total, D].");
+  }
+  if (route_indices.ndim() != 2) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] route_indices must be 2-D [N, top_k].");
+  }
+  if (weights.ndim() != 2) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] weights must be 2-D [N, top_k].");
+  }
+  if (original_tokens.ndim() != 2) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] original_tokens must be 2-D [N, D].");
+  }
+  if (route_indices.dtype() != int32) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] route_indices must have dtype int32.");
+  }
+  if (weights.dtype() != float32) {
+    throw std::invalid_argument(
+        "[moe_combine_exchange] weights must have dtype float32.");
+  }
+
+  int world_size = group.size();
+  if (expert_outputs.shape(1) != world_size * capacity) {
+    std::ostringstream msg;
+    msg << "[moe_combine_exchange] expert_outputs.shape(1)="
+        << expert_outputs.shape(1)
+        << " must equal world_size * capacity = " << world_size << " * "
+        << capacity << " = " << (world_size * capacity) << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int N = original_tokens.shape(0);
+  int D = original_tokens.shape(1);
+  auto combined_shape = Shape{N, D};
+
+  // Always use a CPU stream: eval_cpu handles all work; eval_gpu is not
+  // implemented. For multi-rank groups, detail::communication_stream already
+  // returns CPU (JACCL/MPI are CPU-based), but for singleton groups the
+  // EmptyGroup returns the default-device stream which can be GPU on Metal.
+  auto stream = to_stream(s, Device::cpu);
+
+  return array(
+      std::move(combined_shape),
+      expert_outputs.dtype(),
+      std::make_shared<MoeCombineExchange>(
+          stream, group, num_experts, capacity, deterministic),
+      {expert_outputs, route_indices, weights, original_tokens});
+}
 } // namespace mlx::core::distributed

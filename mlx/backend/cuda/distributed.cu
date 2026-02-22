@@ -122,4 +122,18 @@ void ReduceScatter::eval_gpu(
 void AllToAll::eval_gpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("[AllToAll::eval_gpu] has no CUDA implementation.");
 }
+
+void MoeDispatchExchange::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw std::runtime_error(
+      "[MoeDispatchExchange::eval_gpu] has no CUDA implementation.");
+}
+
+void MoeCombineExchange::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw std::runtime_error(
+      "[MoeCombineExchange::eval_gpu] has no CUDA implementation.");
+}
 } // namespace mlx::core::distributed

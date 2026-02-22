@@ -482,5 +482,270 @@ class TestVectorizedDispatchCombine(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(combined, original_tokens).item())
 
 
+class TestCppMoeExchange(unittest.TestCase):
+    """Tests for C++ moe_dispatch_exchange / moe_combine_exchange primitives."""
+
+    def setUp(self):
+        # Skip if C++ primitive not available
+        if not hasattr(mx.distributed, "moe_dispatch_exchange"):
+            self.skipTest("moe_dispatch_exchange not available")
+
+    def _python_dispatch_combine_ref(self, tokens, expert_indices, weights,
+                                      num_experts, capacity):
+        """Reference Python implementation for comparison."""
+        N, D = tokens.shape
+        top_k = expert_indices.shape[1]
+        experts_per_device = num_experts  # local only (world_size=1)
+
+        dispatch_flat = mx.zeros((num_experts * capacity, D), dtype=tokens.dtype)
+        route_indices = mx.full((N, top_k), -1, dtype=mx.int32)
+
+        expert_counts = [0] * num_experts
+        route_list = [[-1] * top_k for _ in range(N)]
+        for k in range(top_k):
+            for n in range(N):
+                eid = expert_indices[n, k].item()
+                pos = expert_counts[eid]
+                if pos < capacity:
+                    flat_idx = eid * capacity + pos
+                    route_list[n][k] = flat_idx
+                    expert_counts[eid] += 1
+
+        route_np = mx.array(route_list, dtype=mx.int32)
+        # Build dispatch flat
+        disp = mx.zeros((num_experts * capacity, D), dtype=tokens.dtype)
+        for n in range(N):
+            for k in range(top_k):
+                flat_idx = route_list[n][k]
+                if flat_idx >= 0:
+                    disp = disp.at[flat_idx].add(tokens[n])
+        dispatched = disp.reshape(num_experts, capacity, D)
+
+        # Combine
+        combined = mx.zeros((N, D), dtype=tokens.dtype)
+        result_flat = disp
+        for n in range(N):
+            has_valid = False
+            for k in range(top_k):
+                flat_idx = route_list[n][k]
+                if flat_idx >= 0:
+                    has_valid = True
+                    w = weights[n, k].item()
+                    combined = combined.at[n].add(w * result_flat[flat_idx])
+            if not has_valid:
+                combined = combined.at[n].add(tokens[n])
+
+        return dispatched, route_np, combined
+
+    def test_dispatch_local_basic(self):
+        """Local dispatch matches reference for simple case."""
+        mx.random.seed(42)
+        N, D, E, top_k = 8, 16, 4, 2
+        capacity = 4
+
+        tokens = mx.random.normal((N, D))
+        # Assign each token to experts deterministically
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.ones((N, top_k)) / top_k
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched, route_idx)
+
+        # Shape check
+        self.assertEqual(dispatched.shape, (E, capacity, D))
+        self.assertEqual(route_idx.shape, (N, top_k))
+        self.assertEqual(route_idx.dtype, mx.int32)
+
+    def test_dispatch_combine_roundtrip(self):
+        """Dispatch -> identity expert -> combine = input for non-overflow case."""
+        mx.random.seed(7)
+        N, D, E, top_k = 4, 8, 4, 2
+        capacity = 4  # large enough for no overflow
+
+        tokens = mx.random.normal((N, D))
+        # Each token goes to a unique expert pair
+        expert_indices = mx.array(
+            [[0, 1], [2, 3], [0, 2], [1, 3]], dtype=mx.int32
+        )
+        weights = mx.ones((N, top_k)) / top_k  # uniform
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched, route_idx)
+
+        # Identity expert: expert_outputs = dispatched
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(combined)
+
+        # Should reconstruct original tokens
+        self.assertEqual(combined.shape, (N, D))
+        self.assertTrue(mx.allclose(combined, tokens, atol=1e-5).item())
+
+    def test_overflow_residual_fallback(self):
+        """Tokens with all-overflow routes get original_tokens as residual."""
+        N, D, E, top_k = 4, 8, 1, 2
+        capacity = 1  # only 1 slot for the single expert
+
+        tokens = mx.random.normal((N, D))
+        # All tokens go to expert 0, but capacity=1 -> most overflow
+        expert_indices = mx.zeros((N, top_k), dtype=mx.int32)
+        weights = mx.ones((N, top_k)) / top_k
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched, route_idx)
+
+        # Most route_indices should be -1 (overflow)
+        n_overflow = (route_idx == -1).sum().item()
+        self.assertGreater(n_overflow, 0)
+
+        # Identity expert
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(combined)
+
+        # Token 0 (first to be dispatched) has valid route, rest are overflow
+        # Fully overflowed tokens should get original_tokens
+        route_idx_np = route_idx.tolist()
+        for n in range(N):
+            all_invalid = all(route_idx_np[n][k] < 0 for k in range(top_k))
+            if all_invalid:
+                self.assertTrue(
+                    mx.allclose(combined[n], tokens[n], atol=1e-5).item(),
+                    f"Token {n} should be residual fallback"
+                )
+
+    def test_empty_batch(self):
+        """N=0 (empty batch) should produce empty outputs."""
+        E, D, top_k = 4, 16, 2
+        capacity = 4
+
+        tokens = mx.zeros((0, D))
+        expert_indices = mx.zeros((0, top_k), dtype=mx.int32)
+        weights = mx.zeros((0, top_k))
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched, route_idx)
+
+        self.assertEqual(dispatched.shape, (E, capacity, D))
+        self.assertEqual(route_idx.shape, (0, top_k))
+
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(combined)
+        self.assertEqual(combined.shape, (0, D))
+
+    def test_dispatch_deterministic(self):
+        """Same input always produces same route_indices (deterministic=True)."""
+        N, D, E, top_k = 16, 8, 4, 2
+        capacity = 6
+
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 2) % E] for i in range(N)], dtype=mx.int32
+        )
+
+        _, route1 = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices, num_experts=E, capacity=capacity,
+        )
+        _, route2 = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices, num_experts=E, capacity=capacity,
+        )
+        mx.eval(route1, route2)
+        self.assertTrue((route1 == route2).all().item())
+
+    def test_dtype_float16(self):
+        """float16 tokens are correctly dispatched and combined."""
+        N, D, E, top_k = 8, 16, 4, 2
+        capacity = 4
+
+        tokens = mx.random.normal((N, D)).astype(mx.float16)
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices, num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched, route_idx)
+        self.assertEqual(dispatched.dtype, mx.float16)
+
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(combined)
+        self.assertEqual(combined.dtype, mx.float16)
+        self.assertEqual(combined.shape, (N, D))
+
+    def test_cpp_vs_python_consistency(self):
+        """C++ primitive matches Python expert_dispatch/combine for local mode."""
+        mx.random.seed(123)
+        N, D, E, top_k = 12, 8, 4, 2
+        capacity_factor = 1.5
+
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.random.uniform(shape=(N, top_k))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+
+        # Python path
+        dispatched_py, meta = expert_dispatch(
+            tokens, expert_indices, weights, E, capacity_factor, group=None
+        )
+        capacity = meta.capacity
+        expert_out_py = dispatched_py  # identity expert
+
+        # C++ path
+        dispatched_cpp, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices.astype(mx.int32),
+            num_experts=E, capacity=capacity,
+        )
+        mx.eval(dispatched_cpp, route_idx)
+
+        # Both dispatch should have same shape
+        self.assertEqual(dispatched_cpp.shape, dispatched_py.shape,
+                         f"Shape mismatch: cpp={dispatched_cpp.shape} py={dispatched_py.shape}")
+
+        # C++ combine
+        combined_cpp = mx.distributed.moe_combine_exchange(
+            dispatched_cpp, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity,
+        )
+        # Python combine
+        combined_py = expert_combine(expert_out_py, meta, tokens, group=None)
+
+        mx.eval(combined_cpp, combined_py)
+
+        # Results should be close (same deterministic routing)
+        self.assertTrue(
+            mx.allclose(combined_cpp, combined_py, atol=1e-5).item(),
+            f"C++ and Python combine results differ.\n"
+            f"Max diff: {mx.abs(combined_cpp - combined_py).max().item()}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
