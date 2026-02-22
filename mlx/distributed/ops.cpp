@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/cuda/cuda.h"
@@ -18,6 +19,45 @@ Group to_group(std::optional<Group> group) {
   } else {
     return distributed::init();
   }
+}
+
+// Auto mode: select CPU or Metal based on work size
+MoeBackend resolve_auto_backend(int N, int top_k, int D, int elem_size) {
+  // Environment variable override
+  const char* env = std::getenv("MLX_MOE_EP_BACKEND");
+  if (env) {
+    std::string val(env);
+    if (val == "cpu") return MoeBackend::Cpu;
+    if (val == "metal") return MoeBackend::Metal;
+    // "auto" falls through to heuristic
+  }
+
+  // GPU threshold from environment or default 2MB
+  size_t gpu_switch_bytes = 2 * 1024 * 1024;
+  const char* thresh_env = std::getenv("MLX_MOE_EP_GPU_SWITCH_BYTES");
+  if (thresh_env) {
+    char* end = nullptr;
+    long val = std::strtol(thresh_env, &end, 10);
+    if (end != thresh_env && val > 0) {
+      gpu_switch_bytes = static_cast<size_t>(val);
+    }
+  }
+
+  size_t work_bytes = static_cast<size_t>(N) * top_k * D * elem_size;
+  // For now, always return Cpu since Metal eval_gpu is placeholder.
+  // When Metal kernels are fully implemented, this will check
+  // metal::is_available() and work_bytes >= gpu_switch_bytes.
+  (void)gpu_switch_bytes;
+  (void)work_bytes;
+  return MoeBackend::Cpu;
+}
+
+MoeBackend resolve_backend_str(const std::string& backend) {
+  if (backend == "auto") return MoeBackend::Auto;
+  if (backend == "cpu") return MoeBackend::Cpu;
+  if (backend == "metal") return MoeBackend::Metal;
+  throw std::invalid_argument(
+      "[moe] invalid backend '" + backend + "', expected auto/cpu/metal");
 }
 
 } // namespace
@@ -218,6 +258,7 @@ std::pair<array, array> moe_dispatch_exchange(
     int capacity,
     std::optional<Group> group_,
     bool deterministic,
+    const std::string& backend,
     StreamOrDevice s) {
   auto group = to_group(group_);
 
@@ -249,6 +290,15 @@ std::pair<array, array> moe_dispatch_exchange(
 
   int world_size = group.size();
   int experts_per_device = num_experts / world_size;
+
+  if (experts_per_device > 65535 || capacity > 65535) {
+    throw std::invalid_argument(
+        "[moe_dispatch_exchange] meta32 overflow: "
+        "experts_per_device=" + std::to_string(experts_per_device) +
+        " capacity=" + std::to_string(capacity) +
+        " — both must be <= 65535 for v3 protocol");
+  }
+
   int cap_total = world_size * capacity;
   int D = tokens.shape(1);
   int N = tokens.shape(0);
@@ -260,17 +310,25 @@ std::pair<array, array> moe_dispatch_exchange(
   auto dispatched_shape = Shape{experts_per_device, cap_total, D};
   auto route_indices_shape = Shape{N, top_k};
 
-  // Always use a CPU stream: eval_cpu handles all work; eval_gpu is not
-  // implemented. For multi-rank groups, detail::communication_stream already
-  // returns CPU (JACCL/MPI are CPU-based), but for singleton groups the
-  // EmptyGroup returns the default-device stream which can be GPU on Metal.
-  auto stream = to_stream(s, Device::cpu);
+  auto moe_backend = resolve_backend_str(backend);
+
+  // Resolve Auto → concrete backend
+  if (moe_backend == MoeBackend::Auto) {
+    int elem_size = static_cast<int>(tokens.itemsize());
+    moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
+  }
+
+  // Backend-dependent stream selection:
+  // Metal -> GPU stream, Cpu/Auto -> CPU stream
+  auto stream = (moe_backend == MoeBackend::Metal)
+      ? to_stream(s, Device::gpu)
+      : to_stream(s, Device::cpu);
 
   auto outputs = array::make_arrays(
       {std::move(dispatched_shape), std::move(route_indices_shape)},
       {tokens.dtype(), int32},
       std::make_shared<MoeDispatchExchange>(
-          stream, group, num_experts, capacity, deterministic),
+          stream, group, num_experts, capacity, deterministic, moe_backend),
       {tokens, expert_indices});
 
   return {outputs[0], outputs[1]};
@@ -285,6 +343,7 @@ array moe_combine_exchange(
     int capacity,
     std::optional<Group> group_,
     bool deterministic,
+    const std::string& backend,
     StreamOrDevice s) {
   auto group = to_group(group_);
 
@@ -363,17 +422,26 @@ array moe_combine_exchange(
   int D = original_tokens.shape(1);
   auto combined_shape = Shape{N, D};
 
-  // Always use a CPU stream: eval_cpu handles all work; eval_gpu is not
-  // implemented. For multi-rank groups, detail::communication_stream already
-  // returns CPU (JACCL/MPI are CPU-based), but for singleton groups the
-  // EmptyGroup returns the default-device stream which can be GPU on Metal.
-  auto stream = to_stream(s, Device::cpu);
+  auto moe_backend = resolve_backend_str(backend);
+
+  // Resolve Auto → concrete backend
+  if (moe_backend == MoeBackend::Auto) {
+    int elem_size = static_cast<int>(expert_outputs.itemsize());
+    int top_k = route_indices.shape(1);
+    moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
+  }
+
+  // Backend-dependent stream selection:
+  // Metal -> GPU stream, Cpu/Auto -> CPU stream
+  auto stream = (moe_backend == MoeBackend::Metal)
+      ? to_stream(s, Device::gpu)
+      : to_stream(s, Device::cpu);
 
   return array(
       std::move(combined_shape),
       expert_outputs.dtype(),
       std::make_shared<MoeCombineExchange>(
-          stream, group, num_experts, capacity, deterministic),
+          stream, group, num_experts, capacity, deterministic, moe_backend),
       {expert_outputs, route_indices, weights, original_tokens});
 }
 } // namespace mlx::core::distributed

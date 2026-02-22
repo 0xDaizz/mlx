@@ -332,6 +332,20 @@ class TestMixtureOfExperts(mlx_tests.MLXTestCase):
         # token1: all overflow → should be original (zeros)
         self.assertTrue(mx.array_equal(combined[1], original_tokens[1]).item())
 
+    def test_ep_backend_parameter(self):
+        """Test ep_backend parameter is stored and used."""
+        moe = MixtureOfExperts(
+            hidden_dim=32, expert_dim=64, num_experts=4,
+            top_k=2, ep_impl="auto", ep_backend="auto",
+        )
+        self.assertEqual(moe.ep_backend, "auto")
+
+        moe2 = MixtureOfExperts(
+            hidden_dim=32, expert_dim=64, num_experts=4,
+            top_k=2, ep_impl="auto", ep_backend="cpu",
+        )
+        self.assertEqual(moe2.ep_backend, "cpu")
+
 
 class TestVectorizedDispatchCombine(mlx_tests.MLXTestCase):
     def test_dispatch_combine_duplicate_expert_across_k(self):
@@ -769,6 +783,39 @@ class TestCppMoeExchange(unittest.TestCase):
             f"C++ and Python combine results differ.\n"
             f"Max diff: {mx.abs(combined_cpp - combined_py).max().item()}"
         )
+
+    def test_backend_auto(self):
+        """Test that backend='auto' works (resolves to cpu in current build)."""
+        N, D, top_k = 8, 16, 2
+        num_experts = self._world_size * 2
+        capacity = 4
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.random.randint(0, num_experts, shape=(N, top_k)).astype(mx.int32)
+
+        # backend="auto" should work without error
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=num_experts, capacity=capacity,
+            backend="auto",
+        )
+        mx.eval(dispatched, route_idx)
+
+        # Verify shapes are correct
+        world_size = self._world_size
+        experts_per_device = num_experts // world_size
+        self.assertEqual(dispatched.shape, (experts_per_device, world_size * capacity, D))
+        self.assertEqual(route_idx.shape, (N, top_k))
+
+        # Run combine with auto backend too
+        expert_out = dispatched * 2.0  # simulate expert computation
+        weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+        combined = mx.distributed.moe_combine_exchange(
+            expert_out, route_idx, weights, tokens,
+            num_experts=num_experts, capacity=capacity,
+            backend="auto",
+        )
+        mx.eval(combined)
+        self.assertEqual(combined.shape, (N, D))
 
 
 if __name__ == "__main__":

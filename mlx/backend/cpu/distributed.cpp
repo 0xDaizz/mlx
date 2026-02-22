@@ -224,25 +224,35 @@ void MoeDispatchExchange::eval_cpu(
       return;
     }
 
-    // world_size == 2: variable exchange + local bypass
+    // world_size == 2: v3 variable exchange protocol
     if (world_size == 2) {
       int my_rank = grp.rank();
       int peer = 1 - my_rank;
 
-      // Allocate send payload and meta buffers (worst case: all N*top_k tokens remote)
+      // Packet row layout: [meta32(4B) | payload(D*elem_size) | pad]
+      // meta32 = (local_expert << 16) | (pos & 0xFFFF)
+      size_t raw_row = 4 + D * elem_size;
+      int row_stride = static_cast<int>((raw_row + 15) & ~size_t(15)); // align to 16
+
       int max_send = N * top_k;
-      size_t send_payload_nbytes = (size_t)std::max(max_send, 1) * D * elem_size;
-      size_t send_meta_nbytes = (size_t)std::max(max_send, 1) * 2 * sizeof(int32_t);
+      int recv_cap = experts_per_device * capacity; // peer can fill at most capacity per expert
 
-      array send_payload_arr(Shape{std::max(max_send, 1), D}, dtype, nullptr, {});
-      send_payload_arr.set_data(allocator::malloc(send_payload_nbytes));
+      // Allocate packet buffers
+      size_t send_pkt_bytes = static_cast<size_t>(std::max(max_send, 1)) * row_stride;
+      size_t recv_pkt_bytes = static_cast<size_t>(std::max(recv_cap, 1)) * row_stride;
 
-      array send_meta_arr(Shape{std::max(max_send, 1), 2}, int32, nullptr, {});
-      send_meta_arr.set_data(allocator::malloc(send_meta_nbytes));
+      array send_pkt({static_cast<int>(send_pkt_bytes)}, uint8, nullptr, {});
+      send_pkt.set_data(allocator::malloc(send_pkt_bytes));
+      auto* send_pkt_ptr = send_pkt.data<uint8_t>();
 
-      auto* send_payload_bytes =
-          static_cast<uint8_t*>(send_payload_arr.data<void>());
-      auto* send_meta_ptr = send_meta_arr.data<int32_t>();
+      array recv_pkt({static_cast<int>(recv_pkt_bytes)}, uint8, nullptr, {});
+      recv_pkt.set_data(allocator::malloc(recv_pkt_bytes));
+
+      // Count exchange arrays
+      array count_send({1}, int32, nullptr, {});
+      count_send.set_data(allocator::malloc(sizeof(int32_t)));
+      array count_recv({1}, int32, nullptr, {});
+      count_recv.set_data(allocator::malloc(sizeof(int32_t)));
 
       int send_count = 0;
 
@@ -254,122 +264,47 @@ void MoeDispatchExchange::eval_cpu(
           int dest_rank = eid / experts_per_device;
           int local_expert = eid % experts_per_device;
           int pos = expert_counts[eid]++;
-          if (pos >= capacity) {
-            // overflow: route stays -1
-            continue;
-          }
-          // New layout: flat_idx = local_expert * cap_total + dest_rank * capacity + pos
+          if (pos >= capacity) continue;
+
           int flat_idx = local_expert * cap_total + dest_rank * capacity + pos;
           route_ptr[n * top_k + k] = flat_idx;
 
           if (dest_rank == my_rank) {
-            // LOCAL: directly scatter into dispatched output
+            // LOCAL: directly scatter into output
             std::memcpy(
                 out_bytes + flat_idx * D * elem_size,
                 tok_bytes + n * D * elem_size,
                 D * elem_size);
           } else {
-            // REMOTE: pack into send buffer
-            std::memcpy(
-                send_payload_bytes + send_count * D * elem_size,
-                tok_bytes + n * D * elem_size,
-                D * elem_size);
-            send_meta_ptr[send_count * 2 + 0] = local_expert;
-            send_meta_ptr[send_count * 2 + 1] = pos;
+            // REMOTE: pack into send packet
+            uint8_t* row = send_pkt_ptr + static_cast<size_t>(send_count) * row_stride;
+            uint32_t meta = (static_cast<uint32_t>(local_expert) << 16) |
+                            (static_cast<uint32_t>(pos) & 0xFFFF);
+            std::memcpy(row, &meta, 4);
+            std::memcpy(row + 4, tok_bytes + n * D * elem_size, D * elem_size);
             send_count++;
           }
         }
       }
 
-      // Step 1: Exchange remote token counts
-      array send_count_arr(Shape{1}, int32, nullptr, {});
-      send_count_arr.set_data(allocator::malloc(sizeof(int32_t)));
-      send_count_arr.data<int32_t>()[0] = static_cast<int32_t>(send_count);
-
-      array recv_count_arr(Shape{1}, int32, nullptr, {});
-      recv_count_arr.set_data(allocator::malloc(sizeof(int32_t)));
-      recv_count_arr.data<int32_t>()[0] = 0;
-
-      // Both ranks exchange counts using blocking API with rank-parity
+      // Exchange packets
       auto* raw = grp.raw_group().get();
-      bool recv_first = (grp.rank() % 2 != 0);
+      int peer_count = raw->blocking_exchange_v(
+          send_pkt, send_count,
+          recv_pkt, recv_cap,
+          row_stride, peer,
+          detail::ExchangeTag::MoeDispatchCount,
+          detail::ExchangeTag::MoeDispatchPayload,
+          count_send, count_recv);
 
-      if (recv_first) {
-        raw->blocking_recv(recv_count_arr, peer);
-        raw->blocking_send(send_count_arr, peer);
-      } else {
-        raw->blocking_send(send_count_arr, peer);
-        raw->blocking_recv(recv_count_arr, peer);
-      }
-      int peer_send_count = recv_count_arr.data<int32_t>()[0];
-
-      // Step 2: Exchange payload tokens using blocking API with rank-parity
-      array recv_payload_arr(Shape{std::max(peer_send_count, 1), D}, dtype, nullptr, {});
-      recv_payload_arr.set_data(
-          allocator::malloc((size_t)std::max(peer_send_count, 1) * D * elem_size));
-
-      if (recv_first) {
-        if (peer_send_count > 0) {
-          array payload_recv_view =
-              make_subview(recv_payload_arr, {peer_send_count, D}, 0, dtype);
-          raw->blocking_recv(payload_recv_view, peer);
-        }
-        if (send_count > 0) {
-          array payload_send_view =
-              make_subview(send_payload_arr, {send_count, D}, 0, dtype);
-          raw->blocking_send(payload_send_view, peer);
-        }
-      } else {
-        if (send_count > 0) {
-          array payload_send_view =
-              make_subview(send_payload_arr, {send_count, D}, 0, dtype);
-          raw->blocking_send(payload_send_view, peer);
-        }
-        if (peer_send_count > 0) {
-          array payload_recv_view =
-              make_subview(recv_payload_arr, {peer_send_count, D}, 0, dtype);
-          raw->blocking_recv(payload_recv_view, peer);
-        }
-      }
-
-      // Step 3: Exchange metadata using blocking API with rank-parity
-      array recv_meta_arr(Shape{std::max(peer_send_count, 1), 2}, int32, nullptr, {});
-      recv_meta_arr.set_data(
-          allocator::malloc(
-              (size_t)std::max(peer_send_count, 1) * 2 * sizeof(int32_t)));
-
-      if (recv_first) {
-        if (peer_send_count > 0) {
-          array meta_recv_view =
-              make_subview(recv_meta_arr, {peer_send_count, 2}, 0, int32);
-          raw->blocking_recv(meta_recv_view, peer);
-        }
-        if (send_count > 0) {
-          array meta_send_view =
-              make_subview(send_meta_arr, {send_count, 2}, 0, int32);
-          raw->blocking_send(meta_send_view, peer);
-        }
-      } else {
-        if (send_count > 0) {
-          array meta_send_view =
-              make_subview(send_meta_arr, {send_count, 2}, 0, int32);
-          raw->blocking_send(meta_send_view, peer);
-        }
-        if (peer_send_count > 0) {
-          array meta_recv_view =
-              make_subview(recv_meta_arr, {peer_send_count, 2}, 0, int32);
-          raw->blocking_recv(meta_recv_view, peer);
-        }
-      }
-
-      // Step 4: Scatter received remote tokens into output
-      const auto* recv_payload_bytes =
-          static_cast<const uint8_t*>(recv_payload_arr.data<void>());
-      const auto* recv_meta_ptr = recv_meta_arr.data<int32_t>();
-
-      for (int i = 0; i < peer_send_count; i++) {
-        int local_expert = recv_meta_ptr[i * 2 + 0];
-        int slot_pos = recv_meta_ptr[i * 2 + 1];
+      // Scatter received remote tokens into output
+      auto* recv_pkt_ptr = recv_pkt.data<uint8_t>();
+      for (int i = 0; i < peer_count; i++) {
+        const uint8_t* row = recv_pkt_ptr + static_cast<size_t>(i) * row_stride;
+        uint32_t meta;
+        std::memcpy(&meta, row, 4);
+        int local_expert = static_cast<int>(meta >> 16);
+        int slot_pos = static_cast<int>(meta & 0xFFFF);
         if (local_expert < 0 || local_expert >= experts_per_device ||
             slot_pos < 0 || slot_pos >= capacity) {
           throw std::runtime_error(
@@ -377,11 +312,10 @@ void MoeDispatchExchange::eval_cpu(
               "local_expert=" + std::to_string(local_expert) +
               " slot_pos=" + std::to_string(slot_pos));
         }
-        // flat_idx in output: local_expert * cap_total + peer * capacity + slot_pos
         int recv_flat_idx = local_expert * cap_total + peer * capacity + slot_pos;
         std::memcpy(
             out_bytes + recv_flat_idx * D * elem_size,
-            recv_payload_bytes + i * D * elem_size,
+            row + 4,
             D * elem_size);
       }
       return;
@@ -598,294 +532,234 @@ void MoeCombineExchange::eval_cpu(
       return;
     }
 
-    // world_size == 2: variable exchange + local bypass
+    // world_size == 2: v3 combine protocol
     if (world_size == 2) {
       int my_rank = grp.rank();
       int peer = 1 - my_rank;
 
       const auto* eo_bytes = static_cast<const uint8_t*>(eo_raw);
 
-      // Collect remote (n, k) pairs in k-outer, n-inner order
-      // These are tokens we routed to peer, in dispatch they were sent out,
-      // now we expect results back from peer for these.
-      std::vector<std::pair<int, int>> remote_nk;
-      remote_nk.reserve(N * top_k);
+      // Response row layout: [token_slot32(4B) | payload(D*elem_size) | pad]
+      size_t raw_resp_row = 4 + D * elem_size;
+      int resp_stride = static_cast<int>((raw_resp_row + 15) & ~size_t(15));
 
+      // Request row layout: [token_slot32(4B) | local_expert16(2B) | pos16(2B)]
+      int req_stride = 8;
+
+      int max_local_routes = N * top_k;           // max requests WE send
+      int max_peer_routes = experts_per_device * capacity;  // max requests PEER can send
+
+      // Allocate request buffers
+      size_t req_send_bytes = static_cast<size_t>(std::max(max_local_routes, 1)) * req_stride;
+      size_t req_recv_bytes = static_cast<size_t>(std::max(max_peer_routes, 1)) * req_stride;
+      array req_send({static_cast<int>(req_send_bytes)}, uint8, nullptr, {});
+      req_send.set_data(allocator::malloc(req_send_bytes));
+      array req_recv({static_cast<int>(req_recv_bytes)}, uint8, nullptr, {});
+      req_recv.set_data(allocator::malloc(req_recv_bytes));
+
+      // Allocate response buffers — responses bounded by received requests / sent requests
+      size_t resp_send_bytes = static_cast<size_t>(std::max(max_peer_routes, 1)) * resp_stride;
+      size_t resp_recv_bytes = static_cast<size_t>(std::max(max_local_routes, 1)) * resp_stride;
+      array resp_send({static_cast<int>(resp_send_bytes)}, uint8, nullptr, {});
+      resp_send.set_data(allocator::malloc(resp_send_bytes));
+      array resp_recv({static_cast<int>(resp_recv_bytes)}, uint8, nullptr, {});
+      resp_recv.set_data(allocator::malloc(resp_recv_bytes));
+
+      // Count exchange arrays (reused for both request and response exchanges)
+      array count_send({1}, int32, nullptr, {});
+      count_send.set_data(allocator::malloc(sizeof(int32_t)));
+      array count_recv({1}, int32, nullptr, {});
+      count_recv.set_data(allocator::malloc(sizeof(int32_t)));
+
+      // Lambda for weighted accumulate (handles all dtypes)
+      auto weighted_add = [&](void* dst_raw, const void* src_raw, float w, int D) {
+        switch (dtype) {
+          case float32: {
+            auto* dst = static_cast<float*>(dst_raw);
+            const auto* src = static_cast<const float*>(src_raw);
+            for (int d = 0; d < D; d++) dst[d] += w * src[d];
+            break;
+          }
+          case float16: {
+            auto* dst = static_cast<float*>(dst_raw); // accumulate in float32
+            const auto* src = static_cast<const float16_t*>(src_raw);
+            for (int d = 0; d < D; d++) dst[d] += w * static_cast<float>(src[d]);
+            break;
+          }
+          case bfloat16: {
+            auto* dst = static_cast<float*>(dst_raw); // accumulate in float32
+            const auto* src = static_cast<const bfloat16_t*>(src_raw);
+            for (int d = 0; d < D; d++) dst[d] += w * static_cast<float>(src[d]);
+            break;
+          }
+          default:
+            throw std::runtime_error("[MoeCombineExchange] Unsupported dtype");
+        }
+      };
+
+      // Accumulation buffer (always float32 for precision)
+      std::vector<float> accum(static_cast<size_t>(N) * D, 0.0f);
+      std::vector<bool> has_valid(N, false);
+
+      int req_send_count = 0;
+      auto* req_send_ptr = req_send.data<uint8_t>();
+
+      // Step 1: Process all routes, accumulate local, pack remote requests
       for (int k = 0; k < top_k; k++) {
         for (int n = 0; n < N; n++) {
           int flat_idx = ri_raw[n * top_k + k];
           if (flat_idx < 0) continue;
-          // Decode dest_rank from flat_idx (new layout)
-          // flat_idx = local_expert * cap_total + dest_rank * capacity + pos
+
           int remainder = flat_idx % cap_total;
           int dest_rank = remainder / capacity;
-          if (dest_rank != my_rank) {
-            remote_nk.push_back({n, k});
+          float w = w_raw[n * top_k + k];
+
+          if (dest_rank == my_rank) {
+            // LOCAL: accumulate directly
+            has_valid[n] = true;
+            weighted_add(
+                accum.data() + static_cast<size_t>(n) * D,
+                eo_bytes + static_cast<size_t>(flat_idx) * D * elem_size,
+                w, D);
+          } else {
+            // REMOTE: pack request
+            int local_expert_idx = flat_idx / cap_total;
+            int pos = remainder % capacity;
+            uint32_t token_slot = static_cast<uint32_t>(n * top_k + k);
+            uint16_t le16 = static_cast<uint16_t>(local_expert_idx);
+            uint16_t pos16 = static_cast<uint16_t>(pos);
+
+            uint8_t* row = req_send_ptr + static_cast<size_t>(req_send_count) * req_stride;
+            std::memcpy(row, &token_slot, 4);
+            std::memcpy(row + 4, &le16, 2);
+            std::memcpy(row + 6, &pos16, 2);
+            req_send_count++;
+            has_valid[n] = true;
           }
         }
       }
 
-      int my_remote_count = static_cast<int>(remote_nk.size());
-
-      // Exchange counts: send how many results we expect from peer,
-      // recv how many results peer expects from us (= how many tokens peer sent us)
-      array send_count_arr(Shape{1}, int32, nullptr, {});
-      send_count_arr.set_data(allocator::malloc(sizeof(int32_t)));
-      send_count_arr.data<int32_t>()[0] = my_remote_count;
-
-      array recv_count_arr(Shape{1}, int32, nullptr, {});
-      recv_count_arr.set_data(allocator::malloc(sizeof(int32_t)));
-      recv_count_arr.data<int32_t>()[0] = 0;
-
       auto* raw = grp.raw_group().get();
-      bool recv_first = (grp.rank() % 2 != 0);
 
-      if (recv_first) {
-        raw->blocking_recv(recv_count_arr, peer);
-        raw->blocking_send(send_count_arr, peer);
-      } else {
-        raw->blocking_send(send_count_arr, peer);
-        raw->blocking_recv(recv_count_arr, peer);
-      }
-      int peer_remote_count = recv_count_arr.data<int32_t>()[0];
-      // peer_remote_count = number of tokens peer sent us in dispatch
-      //                   = number of results we must send back
+      // Step 2: Exchange requests
+      int peer_req_count = raw->blocking_exchange_v(
+          req_send, req_send_count,
+          req_recv, max_peer_routes,
+          req_stride, peer,
+          detail::ExchangeTag::MoeCombineReqCount,
+          detail::ExchangeTag::MoeCombineReqPayload,
+          count_send, count_recv);
 
-      // Exchange meta: send our remote (local_expert, pos) pairs to peer
-      // so peer can scatter our results into their combined output.
-      // Recv peer's (local_expert, pos) pairs to look up results in our expert_outputs.
-      //
-      // For each entry in remote_nk: decode local_expert and pos from route_idx
-      // (these are local_expert and pos AS SEEN BY peer, i.e., peer's expert index and slot)
-      int send_meta_count = my_remote_count;
-      array send_result_meta(Shape{std::max(send_meta_count, 1), 2}, int32, nullptr, {});
-      send_result_meta.set_data(
-          allocator::malloc(
-              (size_t)std::max(send_meta_count, 1) * 2 * sizeof(int32_t)));
-      auto* send_result_meta_ptr = send_result_meta.data<int32_t>();
+      // Step 3: Build responses from received requests
+      auto* req_recv_ptr = req_recv.data<uint8_t>();
+      auto* resp_send_ptr = resp_send.data<uint8_t>();
 
-      for (int i = 0; i < send_meta_count; i++) {
-        auto [n, k] = remote_nk[i];
-        int flat_idx = ri_raw[n * top_k + k];
-        // flat_idx = local_expert * cap_total + dest_rank * capacity + pos
-        int local_expert = flat_idx / cap_total;
-        int remainder = flat_idx % cap_total;
-        int pos = remainder % capacity;
-        send_result_meta_ptr[i * 2 + 0] = local_expert;
-        send_result_meta_ptr[i * 2 + 1] = pos;
-      }
+      for (int i = 0; i < peer_req_count; i++) {
+        const uint8_t* req_row = req_recv_ptr + static_cast<size_t>(i) * req_stride;
+        uint32_t token_slot;
+        uint16_t le16, pos16;
+        std::memcpy(&token_slot, req_row, 4);
+        std::memcpy(&le16, req_row + 4, 2);
+        std::memcpy(&pos16, req_row + 6, 2);
 
-      int recv_meta_count = peer_remote_count;
-      array recv_result_meta(Shape{std::max(recv_meta_count, 1), 2}, int32, nullptr, {});
-      recv_result_meta.set_data(
-          allocator::malloc(
-              (size_t)std::max(recv_meta_count, 1) * 2 * sizeof(int32_t)));
+        int local_expert = static_cast<int>(le16);
+        int slot_pos = static_cast<int>(pos16);
 
-      if (recv_first) {
-        if (recv_meta_count > 0) {
-          array meta_recv_view =
-              make_subview(recv_result_meta, {recv_meta_count, 2}, 0, int32);
-          raw->blocking_recv(meta_recv_view, peer);
-        }
-        if (send_meta_count > 0) {
-          array meta_send_view =
-              make_subview(send_result_meta, {send_meta_count, 2}, 0, int32);
-          raw->blocking_send(meta_send_view, peer);
-        }
-      } else {
-        if (send_meta_count > 0) {
-          array meta_send_view =
-              make_subview(send_result_meta, {send_meta_count, 2}, 0, int32);
-          raw->blocking_send(meta_send_view, peer);
-        }
-        if (recv_meta_count > 0) {
-          array meta_recv_view =
-              make_subview(recv_result_meta, {recv_meta_count, 2}, 0, int32);
-          raw->blocking_recv(meta_recv_view, peer);
-        }
-      }
-
-      // Pack results for peer: for each of peer's tokens (indexed by recv_result_meta),
-      // look up expert_outputs at: local_expert * cap_total + my_rank * capacity + pos
-      const auto* recv_meta_ptr = recv_result_meta.data<int32_t>();
-
-      array send_results(Shape{std::max(recv_meta_count, 1), D}, dtype, nullptr, {});
-      send_results.set_data(
-          allocator::malloc(
-              (size_t)std::max(recv_meta_count, 1) * D * elem_size));
-      auto* send_results_bytes = static_cast<uint8_t*>(send_results.data<void>());
-
-      for (int i = 0; i < recv_meta_count; i++) {
-        int local_expert = recv_meta_ptr[i * 2 + 0];
-        int slot_pos = recv_meta_ptr[i * 2 + 1];
         if (local_expert < 0 || local_expert >= experts_per_device ||
             slot_pos < 0 || slot_pos >= capacity) {
           throw std::runtime_error(
-              "[MoeCombineExchange] received out-of-bounds result metadata: "
-              "local_expert=" + std::to_string(local_expert) +
-              " slot_pos=" + std::to_string(slot_pos));
+              "[MoeCombineExchange] out-of-bounds request: local_expert=" +
+              std::to_string(local_expert) + " pos=" + std::to_string(slot_pos));
         }
-        // Expert output for peer's token: slot from peer in our layout
-        // = local_expert * cap_total + peer * capacity + slot_pos
+
+        // Lookup: expert_outputs at peer's slot
         int eo_flat = local_expert * cap_total + peer * capacity + slot_pos;
+
+        // Pack response: [token_slot | payload]
+        uint8_t* resp_row = resp_send_ptr + static_cast<size_t>(i) * resp_stride;
+        std::memcpy(resp_row, &token_slot, 4);
         std::memcpy(
-            send_results_bytes + i * D * elem_size,
-            eo_bytes + eo_flat * D * elem_size,
+            resp_row + 4,
+            eo_bytes + static_cast<size_t>(eo_flat) * D * elem_size,
             D * elem_size);
       }
 
-      // Exchange results
-      array recv_results(Shape{std::max(send_meta_count, 1), D}, dtype, nullptr, {});
-      recv_results.set_data(
-          allocator::malloc(
-              (size_t)std::max(send_meta_count, 1) * D * elem_size));
+      // Step 4: Exchange responses
+      int peer_res_count = raw->blocking_exchange_v(
+          resp_send, peer_req_count,
+          resp_recv, max_local_routes,
+          resp_stride, peer,
+          detail::ExchangeTag::MoeCombineResCount,
+          detail::ExchangeTag::MoeCombineResPayload,
+          count_send, count_recv);
 
-      if (recv_first) {
-        if (send_meta_count > 0) {
-          array res_recv_view =
-              make_subview(recv_results, {send_meta_count, D}, 0, dtype);
-          raw->blocking_recv(res_recv_view, peer);
+      // Step 5: Process responses — accumulate into output
+      auto* resp_recv_ptr = resp_recv.data<uint8_t>();
+      for (int i = 0; i < peer_res_count; i++) {
+        const uint8_t* resp_row = resp_recv_ptr + static_cast<size_t>(i) * resp_stride;
+        uint32_t token_slot;
+        std::memcpy(&token_slot, resp_row, 4);
+
+        if (token_slot >= static_cast<uint32_t>(N * top_k)) {
+          throw std::runtime_error(
+              "[MoeCombineExchange] invalid token_slot=" +
+              std::to_string(token_slot));
         }
-        if (recv_meta_count > 0) {
-          array res_send_view =
-              make_subview(send_results, {recv_meta_count, D}, 0, dtype);
-          raw->blocking_send(res_send_view, peer);
-        }
-      } else {
-        if (recv_meta_count > 0) {
-          array res_send_view =
-              make_subview(send_results, {recv_meta_count, D}, 0, dtype);
-          raw->blocking_send(res_send_view, peer);
-        }
-        if (send_meta_count > 0) {
-          array res_recv_view =
-              make_subview(recv_results, {send_meta_count, D}, 0, dtype);
-          raw->blocking_recv(res_recv_view, peer);
-        }
+
+        int n = static_cast<int>(token_slot) / top_k;
+        int k = static_cast<int>(token_slot) % top_k;
+        float w = w_raw[n * top_k + k];
+
+        weighted_add(
+            accum.data() + static_cast<size_t>(n) * D,
+            resp_row + 4,
+            w, D);
       }
 
-      // Build a lookup: for each (n*top_k+k) that is remote, what is its
-      // index in recv_results? remote_nk and recv_results are in same order.
-      std::vector<int> remote_recv_idx(N * top_k, -1);
-      for (int i = 0; i < static_cast<int>(remote_nk.size()); i++) {
-        auto [n, k] = remote_nk[i];
-        remote_recv_idx[n * top_k + k] = i;
-      }
-
-      // Weighted combine: for each token n, accumulate local + remote results
+      // Step 6: Write output
       switch (dtype) {
         case float32: {
-          const auto* eo_f = static_cast<const float*>(eo_raw);
-          const auto* recv_f =
-              static_cast<const float*>(recv_results.data<void>());
           auto* out_f = static_cast<float*>(out0_raw);
           const auto* orig_f = static_cast<const float*>(orig_raw);
-
           for (int n = 0; n < N; n++) {
-            float* dst = out_f + n * D;
-            std::fill(dst, dst + D, 0.0f);
-            bool has_valid = false;
-            for (int k = 0; k < top_k; k++) {
-              int flat_idx = ri_raw[n * top_k + k];
-              if (flat_idx < 0) continue;
-              has_valid = true;
-              float w = w_raw[n * top_k + k];
-              int rri = remote_recv_idx[n * top_k + k];
-              if (rri >= 0) {
-                // Remote result
-                const float* src = recv_f + rri * D;
-                for (int d = 0; d < D; d++) dst[d] += w * src[d];
-              } else {
-                // Local result: read directly from expert_outputs
-                const float* src = eo_f + flat_idx * D;
-                for (int d = 0; d < D; d++) dst[d] += w * src[d];
-              }
-            }
-            if (!has_valid) {
-              std::memcpy(dst, orig_f + n * D, D * sizeof(float));
+            if (has_valid[n]) {
+              std::memcpy(out_f + n * D, accum.data() + static_cast<size_t>(n) * D, D * sizeof(float));
+            } else {
+              std::memcpy(out_f + n * D, orig_f + n * D, D * sizeof(float));
             }
           }
           break;
         }
         case float16: {
-          const auto* eo_h = static_cast<const float16_t*>(eo_raw);
-          const auto* recv_h =
-              static_cast<const float16_t*>(recv_results.data<void>());
           auto* out_h = static_cast<float16_t*>(out0_raw);
           const auto* orig_h = static_cast<const float16_t*>(orig_raw);
-          std::vector<float> accum(D);
-
           for (int n = 0; n < N; n++) {
-            std::fill(accum.begin(), accum.end(), 0.0f);
-            bool has_valid = false;
-            for (int k = 0; k < top_k; k++) {
-              int flat_idx = ri_raw[n * top_k + k];
-              if (flat_idx < 0) continue;
-              has_valid = true;
-              float w = w_raw[n * top_k + k];
-              int rri = remote_recv_idx[n * top_k + k];
-              if (rri >= 0) {
-                const float16_t* src = recv_h + rri * D;
-                for (int d = 0; d < D; d++) {
-                  accum[d] += w * static_cast<float>(src[d]);
-                }
-              } else {
-                const float16_t* src = eo_h + flat_idx * D;
-                for (int d = 0; d < D; d++) {
-                  accum[d] += w * static_cast<float>(src[d]);
-                }
+            if (has_valid[n]) {
+              for (int d = 0; d < D; d++) {
+                out_h[n * D + d] = float16_t(accum[static_cast<size_t>(n) * D + d]);
               }
-            }
-            float16_t* dst = out_h + n * D;
-            if (has_valid) {
-              for (int d = 0; d < D; d++) dst[d] = float16_t(accum[d]);
             } else {
-              std::memcpy(dst, orig_h + n * D, D * sizeof(float16_t));
+              std::memcpy(out_h + n * D, orig_h + n * D, D * sizeof(float16_t));
             }
           }
           break;
         }
         case bfloat16: {
-          const auto* eo_h = static_cast<const bfloat16_t*>(eo_raw);
-          const auto* recv_h =
-              static_cast<const bfloat16_t*>(recv_results.data<void>());
           auto* out_h = static_cast<bfloat16_t*>(out0_raw);
           const auto* orig_h = static_cast<const bfloat16_t*>(orig_raw);
-          std::vector<float> accum(D);
-
           for (int n = 0; n < N; n++) {
-            std::fill(accum.begin(), accum.end(), 0.0f);
-            bool has_valid = false;
-            for (int k = 0; k < top_k; k++) {
-              int flat_idx = ri_raw[n * top_k + k];
-              if (flat_idx < 0) continue;
-              has_valid = true;
-              float w = w_raw[n * top_k + k];
-              int rri = remote_recv_idx[n * top_k + k];
-              if (rri >= 0) {
-                const bfloat16_t* src = recv_h + rri * D;
-                for (int d = 0; d < D; d++) {
-                  accum[d] += w * static_cast<float>(src[d]);
-                }
-              } else {
-                const bfloat16_t* src = eo_h + flat_idx * D;
-                for (int d = 0; d < D; d++) {
-                  accum[d] += w * static_cast<float>(src[d]);
-                }
+            if (has_valid[n]) {
+              for (int d = 0; d < D; d++) {
+                out_h[n * D + d] = bfloat16_t(accum[static_cast<size_t>(n) * D + d]);
               }
-            }
-            bfloat16_t* dst = out_h + n * D;
-            if (has_valid) {
-              for (int d = 0; d < D; d++) dst[d] = bfloat16_t(accum[d]);
             } else {
-              std::memcpy(dst, orig_h + n * D, D * sizeof(bfloat16_t));
+              std::memcpy(out_h + n * D, orig_h + n * D, D * sizeof(bfloat16_t));
             }
           }
           break;
         }
         default:
-          throw std::runtime_error(
-              "[MoeCombineExchange] Unsupported dtype. Use float32, float16, or bfloat16.");
+          throw std::runtime_error("[MoeCombineExchange] Unsupported dtype");
       }
       return;
     }

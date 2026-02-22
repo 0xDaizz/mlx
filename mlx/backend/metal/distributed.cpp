@@ -43,16 +43,16 @@ void MoeDispatchExchange::eval_gpu(
     const std::vector<array>&,
     std::vector<array>&) {
   throw std::runtime_error(
-      "[MoeDispatchExchange::eval_gpu] No GPU implementation yet. "
-      "Run on CPU stream.");
+      "[MoeDispatchExchange::eval_gpu] Metal kernel implementation pending. "
+      "Use stream=mx.cpu or ep_impl='cpu' to route through the CPU backend.");
 }
 
 void MoeCombineExchange::eval_gpu(
     const std::vector<array>&,
     std::vector<array>&) {
   throw std::runtime_error(
-      "[MoeCombineExchange::eval_gpu] No GPU implementation yet. "
-      "Run on CPU stream.");
+      "[MoeCombineExchange::eval_gpu] Metal kernel implementation pending. "
+      "Use stream=mx.cpu or ep_impl='cpu' to route through the CPU backend.");
 }
 
 } // namespace mlx::core::distributed

@@ -388,6 +388,7 @@ void init_distributed(nb::module_& parent_module) {
          int capacity,
          std::optional<mx::distributed::Group> group,
          bool deterministic,
+         const std::string& backend,
          mx::StreamOrDevice s) {
         auto [dispatched, route_idx] = mx::distributed::moe_dispatch_exchange(
             to_array(tokens),
@@ -396,6 +397,7 @@ void init_distributed(nb::module_& parent_module) {
             capacity,
             group,
             deterministic,
+            backend,
             s);
         return nb::make_tuple(dispatched, route_idx);
       },
@@ -406,11 +408,12 @@ void init_distributed(nb::module_& parent_module) {
       "capacity"_a,
       "group"_a = nb::none(),
       "deterministic"_a = true,
+      "backend"_a = "cpu",
       "stream"_a = nb::none(),
       nb::sig(
           "def moe_dispatch_exchange(tokens: array, expert_indices: array, "
           "*, num_experts: int, capacity: int, group: Optional[Group] = None, "
-          "deterministic: bool = True, "
+          "deterministic: bool = True, backend: str = \"cpu\", "
           "stream: Union[None, Stream, Device] = None) -> tuple[array, array]"),
       R"pbdoc(
         Fused MoE dispatch and all-to-all exchange.
@@ -444,6 +447,7 @@ void init_distributed(nb::module_& parent_module) {
          int capacity,
          std::optional<mx::distributed::Group> group,
          bool deterministic,
+         const std::string& backend,
          mx::StreamOrDevice s) {
         return mx::distributed::moe_combine_exchange(
             to_array(expert_outputs),
@@ -454,6 +458,7 @@ void init_distributed(nb::module_& parent_module) {
             capacity,
             group,
             deterministic,
+            backend,
             s);
       },
       "expert_outputs"_a,
@@ -465,12 +470,13 @@ void init_distributed(nb::module_& parent_module) {
       "capacity"_a,
       "group"_a = nb::none(),
       "deterministic"_a = true,
+      "backend"_a = "cpu",
       "stream"_a = nb::none(),
       nb::sig(
           "def moe_combine_exchange(expert_outputs: array, route_indices: array, "
           "weights: array, original_tokens: array, "
           "*, num_experts: int, capacity: int, group: Optional[Group] = None, "
-          "deterministic: bool = True, "
+          "deterministic: bool = True, backend: str = \"cpu\", "
           "stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         Fused MoE all-to-all exchange and combine.

@@ -8,6 +8,8 @@
 
 namespace mlx::core::distributed {
 
+enum class MoeBackend { Auto, Cpu, Metal };
+
 class DistPrimitive : public Primitive {
  public:
   DistPrimitive(Stream stream, Group group)
@@ -186,11 +188,13 @@ class MoeDispatchExchange : public DistPrimitive {
       Group group,
       int num_experts,
       int capacity,
-      bool deterministic)
+      bool deterministic,
+      MoeBackend backend = MoeBackend::Cpu)
       : DistPrimitive(stream, group),
         num_experts_(num_experts),
         capacity_(capacity),
-        deterministic_(deterministic) {}
+        deterministic_(deterministic),
+        backend_(backend) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -208,11 +212,13 @@ class MoeDispatchExchange : public DistPrimitive {
   int num_experts() const { return num_experts_; }
   int capacity() const { return capacity_; }
   bool deterministic() const { return deterministic_; }
+  MoeBackend backend() const { return backend_; }
 
  private:
   int num_experts_;
   int capacity_;
   bool deterministic_;
+  MoeBackend backend_;
 };
 
 class MoeCombineExchange : public DistPrimitive {
@@ -222,11 +228,13 @@ class MoeCombineExchange : public DistPrimitive {
       Group group,
       int num_experts,
       int capacity,
-      bool deterministic)
+      bool deterministic,
+      MoeBackend backend = MoeBackend::Cpu)
       : DistPrimitive(stream, group),
         num_experts_(num_experts),
         capacity_(capacity),
-        deterministic_(deterministic) {}
+        deterministic_(deterministic),
+        backend_(backend) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -244,10 +252,12 @@ class MoeCombineExchange : public DistPrimitive {
   int num_experts() const { return num_experts_; }
   int capacity() const { return capacity_; }
   bool deterministic() const { return deterministic_; }
+  MoeBackend backend() const { return backend_; }
 
  private:
   int num_experts_;
   int capacity_;
   bool deterministic_;
+  MoeBackend backend_;
 };
 } // namespace mlx::core::distributed

@@ -66,6 +66,7 @@ MLX_API std::pair<array, array> moe_dispatch_exchange(
     int capacity,
     std::optional<Group> group = std::nullopt,
     bool deterministic = true,
+    const std::string& backend = "cpu",
     StreamOrDevice s = {});
 
 MLX_API array moe_combine_exchange(
@@ -77,6 +78,7 @@ MLX_API array moe_combine_exchange(
     int capacity,
     std::optional<Group> group = std::nullopt,
     bool deterministic = true,
+    const std::string& backend = "cpu",
     StreamOrDevice s = {});
 
 } // namespace mlx::core::distributed

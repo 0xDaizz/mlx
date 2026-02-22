@@ -360,9 +360,14 @@ class MixtureOfExperts(Module):
         aux_loss_coeff: Load balance loss coefficient. Default: ``0.01``.
         ep_impl: Expert parallelism implementation to use. One of ``"auto"``,
             ``"python"``, or ``"cpp"``. ``"auto"`` uses the Python vectorized
-            path (until C++ VJP is available). ``"cpp"`` uses the fused C++
-            primitive (inference-only, no gradient support). ``"python"``
-            always uses the Python vectorized path. Default: ``"auto"``.
+            path (safe for training; C++ VJP not yet available). ``"cpp"``
+            uses the fused C++ primitive (inference-only, no gradient support).
+            ``"python"`` always uses the Python vectorized path. Default:
+            ``"auto"``.
+        ep_backend: Backend for the C++ MoE exchange. One of ``"auto"``,
+            ``"cpu"``, or ``"metal"``. ``"auto"`` selects based on workload
+            size. Only used when ``ep_impl`` is ``"cpp"`` or ``"auto"`` with
+            C++ path active. Default: ``"auto"``.
     """
 
     def __init__(
@@ -374,6 +379,7 @@ class MixtureOfExperts(Module):
         capacity_factor: float = 1.25,
         aux_loss_coeff: float = 0.01,
         ep_impl: str = "auto",
+        ep_backend: str = "auto",
     ):
         super().__init__()
 
@@ -418,6 +424,7 @@ class MixtureOfExperts(Module):
         self.top_k = top_k
         self.capacity_factor = capacity_factor
         self.ep_impl = ep_impl
+        self.ep_backend = ep_backend
 
         # Router
         self.router = TopKRouter(
@@ -445,7 +452,7 @@ class MixtureOfExperts(Module):
         weights, expert_indices, aux_loss = self.router(x)
 
         # Determine implementation to use
-        # auto: always use Python (until VJP is implemented in Phase 3)
+        # auto: use Python path (safe for training; C++ VJP not yet implemented)
         # cpp: use C++ primitive (inference-only, no grad support)
         # python: always use Python vectorized path
         use_cpp = (
@@ -473,6 +480,7 @@ class MixtureOfExperts(Module):
                 num_experts=self.num_experts,
                 capacity=capacity,
                 group=self._group,
+                backend=self.ep_backend,
             )
             route_idx = mx.stop_gradient(route_idx)
             expert_out = self._run_local_experts(dispatched)
@@ -485,6 +493,7 @@ class MixtureOfExperts(Module):
                 num_experts=self.num_experts,
                 capacity=capacity,
                 group=self._group,
+                backend=self.ep_backend,
             )
         else:
             # Python vectorized path (supports grad)
