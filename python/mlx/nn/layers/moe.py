@@ -263,6 +263,8 @@ def expert_dispatch(
 
     # All-to-all exchange if distributed
     if world_size > 1 and group is not None:
+        # Materialize scatter graph before distributed exchange
+        mx.eval(dispatch_buffer)
         flat = dispatch_buffer.reshape(world_size, -1)
         exchanged = mx.distributed.all_to_all(flat, group=group)
         dispatched = exchanged.reshape(world_size, experts_per_device, capacity, hidden_dim)
