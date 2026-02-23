@@ -1287,5 +1287,316 @@ class TestMoeFallback(unittest.TestCase):
             os.environ.pop("MLX_MOE_EP_FALLBACK_ON_ERROR", None)
 
 
+class TestBatchedExperts(mlx_tests.MLXTestCase):
+    """Tests for batched 3D matmul and gather_mm expert computation."""
+
+    def _make_moe(self, hidden_dim=32, expert_dim=64, num_experts=4, top_k=2):
+        """Helper to create a small MoE for testing."""
+        moe = MixtureOfExperts(
+            hidden_dim, expert_dim, num_experts, top_k=top_k,
+            capacity_factor=1.5,
+        )
+        return moe
+
+    def test_batched_vs_loop_consistency(self):
+        """Batched 3D matmul produces same results as sequential loop."""
+        import os
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32))
+
+        # Run with loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        out_loop, loss_loop = moe(x)
+        mx.eval(out_loop, loss_loop)
+
+        # Invalidate cache before switching mode
+        moe._cached_stacked = None
+
+        # Run with batched
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out_batched, loss_batched = moe(x)
+        mx.eval(out_batched, loss_batched)
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertTrue(
+            mx.allclose(out_loop, out_batched, atol=1e-5, rtol=1e-4).item(),
+            f"Loop vs batched mismatch. Max diff: {mx.abs(out_loop - out_batched).max().item()}"
+        )
+
+    def test_gather_mm_vs_loop_consistency(self):
+        """gather_mm produces same results as sequential loop."""
+        import os
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        out_loop, _ = moe(x)
+        mx.eval(out_loop)
+
+        moe._cached_stacked = None
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "gather_mm"
+        out_gmm, _ = moe(x)
+        mx.eval(out_gmm)
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertTrue(
+            mx.allclose(out_loop, out_gmm, atol=1e-5, rtol=1e-4).item(),
+            f"Loop vs gather_mm mismatch. Max diff: {mx.abs(out_loop - out_gmm).max().item()}"
+        )
+
+    def test_batched_single_token(self):
+        """Batched mode handles N=1 correctly."""
+        import os
+        moe = self._make_moe()
+        x = mx.random.normal((1, 32))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertEqual(out.shape, (1, 32))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+    def test_batched_large_batch(self):
+        """Batched mode handles larger batch sizes."""
+        import os
+        moe = self._make_moe(hidden_dim=64, expert_dim=128, num_experts=8)
+        x = mx.random.normal((64, 64))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertEqual(out.shape, (64, 64))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+    def test_stacked_weight_cache_invalidation(self):
+        """Cache should be invalidated when parameters are updated."""
+        moe = self._make_moe()
+        x = mx.random.normal((4, 32))
+
+        # Trigger cache creation
+        _ = moe._get_stacked_weights()
+        self.assertIsNotNone(moe._cached_stacked)
+
+        # Update parameters (simulates load_weights)
+        moe.update(moe.parameters())
+        self.assertIsNone(moe._cached_stacked)
+
+    def test_stacked_weight_cache_reuse(self):
+        """Stacked weight cache should be reused across calls."""
+        moe = self._make_moe()
+
+        w1 = moe._get_stacked_weights()
+        w2 = moe._get_stacked_weights()
+
+        # Same object references (cached)
+        self.assertIs(w1[0], w2[0])
+        self.assertIs(w1[1], w2[1])
+        self.assertIs(w1[2], w2[2])
+
+    def test_local_ffn_env_flag_default(self):
+        """Default mode (no env var) should use loop path."""
+        import os
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+        moe = self._make_moe()
+        x = mx.random.normal((4, 32))
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        self.assertEqual(out.shape, (4, 32))
+
+    def test_batched_float16(self):
+        """Batched mode works with float16 inputs."""
+        import os
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32)).astype(mx.float16)
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        # Output dtype matches expert weights, not input
+        # (Linear layer outputs match weight dtype)
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+
+class TestZeroCopyCombine(unittest.TestCase):
+    """Tests for zero-copy dual-src combine Metal kernel."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_dispatch_exchange"):
+            self.skipTest("moe_dispatch_exchange not available")
+        self._world_size = 1
+        for backend in ("jaccl", "mpi", "nccl"):
+            try:
+                g = mx.distributed.init(strict=True, backend=backend)
+                if g.size() > 1:
+                    self._world_size = g.size()
+                    break
+            except Exception:
+                pass
+        if self._world_size == 1:
+            try:
+                self._world_size = mx.distributed.init().size()
+            except Exception:
+                self._world_size = 1
+
+    def test_zero_copy_roundtrip_local(self):
+        """Zero-copy: dispatch -> identity -> combine = input for ws=1."""
+        import os
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        try:
+            mx.random.seed(42)
+            N, D, E, top_k = 16, 32, 4, 2
+            capacity = 8
+            tokens = mx.random.normal((N, D))
+            expert_indices = mx.array(
+                [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+            )
+            weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens, expert_indices,
+                num_experts=E, capacity=capacity, backend="metal",
+            )
+            mx.eval(dispatched, route_idx)
+
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched, route_idx, weights, tokens,
+                num_experts=E, capacity=capacity, backend="metal",
+            )
+            mx.eval(combined)
+
+            self.assertEqual(combined.shape, (N, D))
+            self.assertTrue(
+                mx.allclose(combined, tokens, atol=1e-4).item(),
+                f"Zero-copy roundtrip failed. Max diff: {mx.abs(combined - tokens).max().item()}"
+            )
+        finally:
+            os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+    def test_zero_copy_vs_unified_consistency(self):
+        """Zero-copy produces same results as unified_src path."""
+        import os
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        mx.random.seed(77)
+        N, D, E, top_k = 32, 64, 4, 2
+        capacity = 12
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.random.uniform(shape=(N, top_k))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+
+        # Unified path (zero-copy off)
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "0"
+        disp1, ri1 = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(disp1, ri1)
+        # Apply a non-trivial expert transform
+        expert_out1 = disp1 * 2.0 + 1.0
+        comb1 = mx.distributed.moe_combine_exchange(
+            expert_out1, ri1, weights, tokens,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(comb1)
+
+        # Zero-copy path
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        disp2, ri2 = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(disp2, ri2)
+        expert_out2 = disp2 * 2.0 + 1.0
+        comb2 = mx.distributed.moe_combine_exchange(
+            expert_out2, ri2, weights, tokens,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(comb2)
+
+        os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+        self.assertTrue(
+            mx.allclose(comb1, comb2, atol=1e-4).item(),
+            f"Unified vs zero-copy differ. Max diff: {mx.abs(comb1 - comb2).max().item()}"
+        )
+
+    def test_zero_copy_overflow_residual(self):
+        """Zero-copy: all-overflow tokens get original_tokens as residual."""
+        import os
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        try:
+            N, D, E, top_k = 4, 16, 1, 2
+            capacity = 1
+            tokens = mx.random.normal((N, D))
+            expert_indices = mx.zeros((N, top_k), dtype=mx.int32)
+            weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens, expert_indices,
+                num_experts=E, capacity=capacity, backend="metal",
+            )
+            mx.eval(dispatched, route_idx)
+
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched, route_idx, weights, tokens,
+                num_experts=E, capacity=capacity, backend="metal",
+            )
+            mx.eval(combined)
+
+            route_idx_list = route_idx.tolist()
+            for n in range(N):
+                all_invalid = all(route_idx_list[n][k] < 0 for k in range(top_k))
+                if all_invalid:
+                    self.assertTrue(
+                        mx.allclose(combined[n], tokens[n], atol=1e-5).item(),
+                        f"Token {n} should be residual fallback (zero-copy)"
+                    )
+        finally:
+            os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+    def test_zero_copy_env_flag_default_off(self):
+        """Default (no env var) should use the old unified path without error."""
+        import os
+        os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+        N, D, E, top_k = 8, 16, 4, 2
+        capacity = 4
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens, expert_indices,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(dispatched, route_idx)
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched, route_idx, weights, tokens,
+            num_experts=E, capacity=capacity, backend="metal",
+        )
+        mx.eval(combined)
+        self.assertEqual(combined.shape, (N, D))
+
+
 if __name__ == "__main__":
     unittest.main()

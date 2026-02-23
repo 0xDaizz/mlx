@@ -2,12 +2,13 @@
 
 // MoE Expert Parallelism Metal kernel launch helpers.
 //
-// Provides get_moe_kernel() which JIT-compiles and caches the six MoE
+// Provides get_moe_kernel() which JIT-compiles and caches the seven MoE
 // Metal kernels declared in kernels/moe.h:
 //   - moe_dispatch_local
 //   - moe_dispatch_scatter_remote
 //   - moe_combine_gather_remote
 //   - moe_combine_weighted_sum
+//   - moe_combine_weighted_sum_dual_src
 //   - moe_packet_gather
 //   - moe_packet_scatter
 //
@@ -99,6 +100,18 @@ MTL::ComputePipelineState* get_moe_kernel(
       source += "constant int& D [[buffer(5)]], ";
       source += "constant int& N [[buffer(6)]], ";
       source += "constant int& top_k [[buffer(7)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
+    } else if (base_name == "moe_combine_weighted_sum_dual_src") {
+      source += "const device " + type_str + "* local_src [[buffer(0)]], ";
+      source += "const device " + type_str + "* remote_src [[buffer(1)]], ";
+      source += "device " + type_str + "* output [[buffer(2)]], ";
+      source += "const device " + type_str + "* original [[buffer(3)]], ";
+      source += "const device float* weights [[buffer(4)]], ";
+      source += "const device int* src_idx [[buffer(5)]], ";
+      source += "const device int* src_which [[buffer(6)]], ";
+      source += "constant int& D [[buffer(7)]], ";
+      source += "constant int& N [[buffer(8)]], ";
+      source += "constant int& top_k [[buffer(9)]], ";
       source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else if (base_name == "moe_packet_gather") {
       source += "const device " + type_str + "* source [[buffer(0)]], ";

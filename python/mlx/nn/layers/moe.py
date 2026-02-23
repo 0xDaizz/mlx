@@ -510,8 +510,58 @@ class MixtureOfExperts(Module):
 
         return output, aux_loss
 
+    def _get_stacked_weights(self):
+        """Get stacked weights for batched computation, cached for reuse."""
+        if not hasattr(self, '_cached_stacked') or self._cached_stacked is None:
+            # Linear stores weight as [out, in], need [E, in, out] for x @ w
+            self._cached_stacked = (
+                mx.stack([e.w_gate.weight for e in self.experts]).swapaxes(-1, -2),  # [E, D, expert_dim]
+                mx.stack([e.w_up.weight for e in self.experts]).swapaxes(-1, -2),    # [E, D, expert_dim]
+                mx.stack([e.w_down.weight for e in self.experts]).swapaxes(-1, -2),  # [E, expert_dim, D]
+            )
+        return self._cached_stacked
+
+    def update(self, *args, **kwargs):
+        """Override to invalidate stacked weight cache on parameter update."""
+        self._cached_stacked = None
+        return super().update(*args, **kwargs)
+
+    def _run_local_experts_batched(self, dispatched: mx.array) -> mx.array:
+        """Batched 3D matmul expert computation.
+
+        Replaces 3*E sequential matmuls with 3 batched matmuls.
+        dispatched: [E_local, cap_total, D]
+        """
+        w_gate, w_up, w_down = self._get_stacked_weights()
+        # [E, cap, D] @ [E, D, expert_dim] -> [E, cap, expert_dim]
+        gate = dispatched @ w_gate
+        up = dispatched @ w_up
+        h = silu(gate) * up
+        # [E, cap, expert_dim] @ [E, expert_dim, D] -> [E, cap, D]
+        return h @ w_down
+
+    def _run_local_experts_gather_mm(self, dispatched: mx.array) -> mx.array:
+        """gather_mm expert computation for A/B comparison.
+
+        Note: Since dispatched is already grouped by expert as [E, cap, D],
+        gather_mm reduces to standard batched matmul. This path exists for
+        completeness; use 'batched' mode for the same result.
+        """
+        w_gate, w_up, w_down = self._get_stacked_weights()
+        # dispatched: [E, cap, D], weights: [E, D, edim] or [E, edim, D]
+        # Standard batched matmul when groups are already aligned
+        gate = mx.gather_mm(dispatched, w_gate)
+        up = mx.gather_mm(dispatched, w_up)
+        h = silu(gate) * up
+        return mx.gather_mm(h, w_down)
+
     def _run_local_experts(self, dispatched: mx.array) -> mx.array:
         """Run local experts on dispatched tokens.
+
+        Mode controlled by MLX_MOE_EP_LOCAL_FFN env var:
+          'loop' (default): sequential expert loop
+          'batched': batched 3D matmul
+          'gather_mm': gather_mm approach
 
         Args:
             dispatched: [experts_per_device, capacity_total, D] dispatched inputs.
@@ -519,9 +569,18 @@ class MixtureOfExperts(Module):
         Returns:
             [experts_per_device, capacity_total, D] expert outputs.
         """
-        outputs = []
-        for i, expert in enumerate(self.experts):
-            expert_input = dispatched[i]  # [capacity_total, D]
-            expert_output = expert(expert_input)  # [capacity_total, D]
-            outputs.append(expert_output)
-        return mx.stack(outputs, axis=0)
+        import os
+        mode = os.environ.get("MLX_MOE_EP_LOCAL_FFN", "loop")
+
+        if mode == "batched":
+            return self._run_local_experts_batched(dispatched)
+        elif mode == "gather_mm":
+            return self._run_local_experts_gather_mm(dispatched)
+        else:
+            # Default: sequential loop
+            outputs = []
+            for i, expert in enumerate(self.experts):
+                expert_input = dispatched[i]  # [capacity_total, D]
+                expert_output = expert(expert_input)  # [capacity_total, D]
+                outputs.append(expert_output)
+            return mx.stack(outputs, axis=0)
