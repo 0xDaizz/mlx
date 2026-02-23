@@ -8,34 +8,64 @@ alternatives (batched 3D matmul, gather_mm, ideal dense SwiGLU) to validate
 whether batched matmul optimization is worth pursuing.
 
 Kimi K2.5 scale: E=384, top_k=8, D=7168, expert_dim=28672, dtype=float16
+Small scale: E=16, top_k=8, D=512, expert_dim=2048, dtype=float16
 
 Run (single device, no distributed):
-    python3 benchmarks/python/moe_ep_phase55_diag_bench.py
+    python3 benchmarks/python/moe_ep_phase55_diag_bench.py [--scale {small,full}]
 
 Options:
-    --warmup N      warmup iterations (default 3)
-    --iters N       bench iterations (default 10)
+    --scale {small,full}  Model scale (default: small)
+                          small: E=16, D=512 (fits in ~8GB)
+                          full: E=384, D=7168 (Kimi K2.5 scale)
+    --warmup N            warmup iterations (default 3)
+    --iters N             bench iterations (default 10)
 """
 
+import argparse
 import math
 import time
 
 import mlx.core as mx
 from mlx.nn.layers.activations import silu
 
-# ── Parameters (Kimi K2.5 scale) ────────────────────────────────────────────
+# ── Arguments ────────────────────────────────────────────────────────────────
 
-E_total = 384
+parser = argparse.ArgumentParser(description="Phase 5.5 Diagnostic Benchmark")
+parser.add_argument(
+    "--scale",
+    choices=["small", "medium", "full"],
+    default="small",
+    help="Model scale: small (E=16, D=512), medium (E=64, D=2048), or full (E=384, D=7168)",
+)
+parser.add_argument("--warmup", type=int, default=3)
+parser.add_argument("--iters", type=int, default=10)
+args = parser.parse_args()
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+
+if args.scale == "full":
+    E_total = 384
+    D = 7168
+    expert_dim = D * 4  # 28672
+    N_values = [1, 8, 64, 128, 256, 512, 1024, 2048, 4096]
+elif args.scale == "medium":  # ~24GB for stacked weights
+    E_total = 64
+    D = 2048
+    expert_dim = D * 4  # 8192
+    N_values = [1, 8, 64, 128, 256, 512, 1024, 2048]
+else:  # small - fits in ~8GB
+    E_total = 16
+    D = 512
+    expert_dim = D * 4  # 2048
+    N_values = [1, 8, 64, 128, 256, 512, 1024]
+
 ws = 2
-E_local = E_total // ws  # 192
-D = 7168
-expert_dim = D * 4  # 28672
+E_local = E_total // ws
 top_k = 8
 cf = 1.25
 dtype = mx.float16
-N_values = [1, 8, 64, 128, 256, 512, 1024, 2048, 4096]
-warmup_iters = 3
-bench_iters = 10
+warmup_iters = args.warmup
+bench_iters = args.iters
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

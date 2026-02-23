@@ -563,6 +563,11 @@ class MixtureOfExperts(Module):
           'batched': batched 3D matmul
           'gather_mm': gather_mm approach
 
+        At large expert counts (E_local > 64), batched mode creates memory
+        duplication (stacked weights double memory usage). This method
+        automatically falls back to loop mode for large E_local to avoid
+        SSD swap on memory-constrained systems.
+
         Args:
             dispatched: [experts_per_device, capacity_total, D] dispatched inputs.
 
@@ -570,7 +575,13 @@ class MixtureOfExperts(Module):
             [experts_per_device, capacity_total, D] expert outputs.
         """
         import os
-        mode = os.environ.get("MLX_MOE_EP_LOCAL_FFN", "loop")
+        mode = os.environ.get("MLX_MOE_EP_LOCAL_FFN", "batched")
+
+        E_local = len(self.experts)
+        # At large expert counts (E > 64, ~8GB stacked weights), batched mode
+        # creates memory duplication. Fall back to sequential loop.
+        if mode == "batched" and E_local > 64:
+            mode = "loop"
 
         if mode == "batched":
             return self._run_local_experts_batched(dispatched)
