@@ -1,11 +1,16 @@
 // Copyright © 2024 Apple Inc.
 
 #include <cstdlib>
+#include <iostream>
+#include <mutex>
 #include <sstream>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/distributed/distributed_impl.h"
+#include "mlx/distributed/moe_metrics.h"
+#include "mlx/distributed/moe_policy.h"
+#include "mlx/distributed/moe_warmup.h"
 #include "mlx/distributed/ops.h"
 #include "mlx/distributed/primitives.h"
 
@@ -23,33 +28,7 @@ Group to_group(std::optional<Group> group) {
 
 // Auto mode: select CPU or Metal based on work size
 MoeBackend resolve_auto_backend(int N, int top_k, int D, int elem_size) {
-  // Environment variable override
-  const char* env = std::getenv("MLX_MOE_EP_BACKEND");
-  if (env) {
-    std::string val(env);
-    if (val == "cpu") return MoeBackend::Cpu;
-    if (val == "metal") return MoeBackend::Metal;
-    // "auto" falls through to heuristic
-  }
-
-  // GPU threshold from environment or default 2MB
-  size_t gpu_switch_bytes = 2 * 1024 * 1024;
-  const char* thresh_env = std::getenv("MLX_MOE_EP_GPU_SWITCH_BYTES");
-  if (thresh_env) {
-    char* end = nullptr;
-    long val = std::strtol(thresh_env, &end, 10);
-    if (end != thresh_env && val > 0) {
-      gpu_switch_bytes = static_cast<size_t>(val);
-    }
-  }
-
-  size_t work_bytes = static_cast<size_t>(N) * top_k * D * elem_size;
-  // For now, always return Cpu since Metal eval_gpu is placeholder.
-  // When Metal kernels are fully implemented, this will check
-  // metal::is_available() and work_bytes >= gpu_switch_bytes.
-  (void)gpu_switch_bytes;
-  (void)work_bytes;
-  return MoeBackend::Cpu;
+  return MoePolicy::global().resolve(N, top_k, D, elem_size);
 }
 
 MoeBackend resolve_backend_str(const std::string& backend) {
@@ -58,6 +37,22 @@ MoeBackend resolve_backend_str(const std::string& backend) {
   if (backend == "metal") return MoeBackend::Metal;
   throw std::invalid_argument(
       "[moe] invalid backend '" + backend + "', expected auto/cpu/metal");
+}
+
+// GPU stream selection with graceful fallback to CPU
+Stream resolve_moe_stream(MoeBackend& backend, StreamOrDevice s) {
+  if (backend == MoeBackend::Metal) {
+    try {
+      return to_stream(s, Device::gpu);
+    } catch (...) {
+      static std::once_flag warn_once;
+      std::call_once(warn_once, []() {
+        std::cerr << "[MoE EP] GPU stream unavailable. Falling back to CPU.\n";
+      });
+      backend = MoeBackend::Cpu;
+    }
+  }
+  return to_stream(s, Device::cpu);
 }
 
 } // namespace
@@ -318,11 +313,18 @@ std::pair<array, array> moe_dispatch_exchange(
     moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
   }
 
-  // Backend-dependent stream selection:
-  // Metal -> GPU stream, Cpu/Auto -> CPU stream
-  auto stream = (moe_backend == MoeBackend::Metal)
-      ? to_stream(s, Device::gpu)
-      : to_stream(s, Device::cpu);
+  // Metrics: record dispatch call
+  auto& metrics = MoeMetrics::global();
+  metrics.dispatch_calls.fetch_add(1, std::memory_order_relaxed);
+  metrics.total_tokens_dispatched.fetch_add(
+      static_cast<uint64_t>(N), std::memory_order_relaxed);
+  if (moe_backend == MoeBackend::Metal) {
+    metrics.metal_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    metrics.cpu_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  auto stream = resolve_moe_stream(moe_backend, s);
 
   auto outputs = array::make_arrays(
       {std::move(dispatched_shape), std::move(route_indices_shape)},
@@ -431,11 +433,16 @@ array moe_combine_exchange(
     moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
   }
 
-  // Backend-dependent stream selection:
-  // Metal -> GPU stream, Cpu/Auto -> CPU stream
-  auto stream = (moe_backend == MoeBackend::Metal)
-      ? to_stream(s, Device::gpu)
-      : to_stream(s, Device::cpu);
+  // Metrics: record combine call
+  auto& metrics = MoeMetrics::global();
+  metrics.combine_calls.fetch_add(1, std::memory_order_relaxed);
+  if (moe_backend == MoeBackend::Metal) {
+    metrics.metal_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    metrics.cpu_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  auto stream = resolve_moe_stream(moe_backend, s);
 
   return array(
       std::move(combined_shape),
@@ -444,4 +451,13 @@ array moe_combine_exchange(
           stream, group, num_experts, capacity, deterministic, moe_backend),
       {expert_outputs, route_indices, weights, original_tokens});
 }
+
+std::unordered_map<std::string, uint64_t> moe_ep_stats() {
+  return MoeMetrics::global().snapshot();
+}
+
+void moe_ep_reset_stats() {
+  MoeMetrics::global().reset();
+}
+
 } // namespace mlx::core::distributed

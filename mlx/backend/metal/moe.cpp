@@ -2,12 +2,14 @@
 
 // MoE Expert Parallelism Metal kernel launch helpers.
 //
-// Provides get_moe_kernel() which JIT-compiles and caches the four MoE
+// Provides get_moe_kernel() which JIT-compiles and caches the six MoE
 // Metal kernels declared in kernels/moe.h:
 //   - moe_dispatch_local
 //   - moe_dispatch_scatter_remote
 //   - moe_combine_gather_remote
 //   - moe_combine_weighted_sum
+//   - moe_packet_gather
+//   - moe_packet_scatter
 //
 // The actual eval_gpu dispatch logic lives in distributed.cpp.
 
@@ -63,41 +65,58 @@ MTL::ComputePipelineState* get_moe_kernel(
     source += "\ntemplate [[host_name(\"" + kernel_name + "\")]] ";
     source += "[[kernel]] void " + base_name + "<" + type_str + ">(";
 
-    // Replicate the exact parameter signature so Metal compiler can match
-    // the template instantiation. Use device pointers and constants matching
-    // the kernel declarations in kernels/moe.h.
+    // Explicit template instantiation with named parameters so that
+    // Metal [[buffer(N)]] / [[thread_position_in_grid]] attributes
+    // bind to parameters (not types).
     if (base_name == "moe_dispatch_local") {
-      source += "const device " + type_str + "* [[buffer(0)]], ";
-      source += "device " + type_str + "* [[buffer(1)]], ";
-      source += "const device int* [[buffer(2)]], ";
-      source += "const device int* [[buffer(3)]], ";
-      source += "constant int& [[buffer(4)]], ";
-      source += "constant int& [[buffer(5)]], ";
-      source += "uint2 [[thread_position_in_grid]]);\n";
+      source += "const device " + type_str + "* tokens [[buffer(0)]], ";
+      source += "device " + type_str + "* dispatched [[buffer(1)]], ";
+      source += "const device int* slot_map [[buffer(2)]], ";
+      source += "const device int* nk_indices [[buffer(3)]], ";
+      source += "constant int& D [[buffer(4)]], ";
+      source += "constant int& top_k [[buffer(5)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else if (base_name == "moe_dispatch_scatter_remote") {
-      source += "const device " + type_str + "* [[buffer(0)]], ";
-      source += "device " + type_str + "* [[buffer(1)]], ";
-      source += "const device int* [[buffer(2)]], ";
-      source += "constant int& [[buffer(3)]], ";
-      source += "constant int& [[buffer(4)]], ";
-      source += "uint2 [[thread_position_in_grid]]);\n";
+      source += "const device " + type_str + "* recv_payload [[buffer(0)]], ";
+      source += "device " + type_str + "* dispatched [[buffer(1)]], ";
+      source += "const device int* recv_flat_idx [[buffer(2)]], ";
+      source += "constant int& D [[buffer(3)]], ";
+      source += "constant int& cnt [[buffer(4)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else if (base_name == "moe_combine_gather_remote") {
-      source += "const device " + type_str + "* [[buffer(0)]], ";
-      source += "device " + type_str + "* [[buffer(1)]], ";
-      source += "const device int* [[buffer(2)]], ";
-      source += "constant int& [[buffer(3)]], ";
-      source += "constant int& [[buffer(4)]], ";
-      source += "uint2 [[thread_position_in_grid]]);\n";
+      source += "const device " + type_str + "* expert_out [[buffer(0)]], ";
+      source += "device " + type_str + "* send_results [[buffer(1)]], ";
+      source += "const device int* eo_flat_idx [[buffer(2)]], ";
+      source += "constant int& D [[buffer(3)]], ";
+      source += "constant int& cnt [[buffer(4)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else if (base_name == "moe_combine_weighted_sum") {
-      source += "const device " + type_str + "* [[buffer(0)]], ";
-      source += "device " + type_str + "* [[buffer(1)]], ";
-      source += "const device " + type_str + "* [[buffer(2)]], ";
-      source += "const device float* [[buffer(3)]], ";
-      source += "const device int* [[buffer(4)]], ";
-      source += "constant int& [[buffer(5)]], ";
-      source += "constant int& [[buffer(6)]], ";
-      source += "constant int& [[buffer(7)]], ";
-      source += "uint2 [[thread_position_in_grid]]);\n";
+      source += "const device " + type_str + "* data_src [[buffer(0)]], ";
+      source += "device " + type_str + "* output [[buffer(1)]], ";
+      source += "const device " + type_str + "* original [[buffer(2)]], ";
+      source += "const device float* weights [[buffer(3)]], ";
+      source += "const device int* src_idx [[buffer(4)]], ";
+      source += "constant int& D [[buffer(5)]], ";
+      source += "constant int& N [[buffer(6)]], ";
+      source += "constant int& top_k [[buffer(7)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
+    } else if (base_name == "moe_packet_gather") {
+      source += "const device " + type_str + "* source [[buffer(0)]], ";
+      source += "device uint8_t* packet [[buffer(1)]], ";
+      source += "const device int* src_idx [[buffer(2)]], ";
+      source += "const device uint32_t* headers [[buffer(3)]], ";
+      source += "constant int& D [[buffer(4)]], ";
+      source += "constant int& cnt [[buffer(5)]], ";
+      source += "constant int& row_stride [[buffer(6)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
+    } else if (base_name == "moe_packet_scatter") {
+      source += "const device uint8_t* packet [[buffer(0)]], ";
+      source += "device " + type_str + "* target [[buffer(1)]], ";
+      source += "const device int* flat_idx [[buffer(2)]], ";
+      source += "constant int& D [[buffer(3)]], ";
+      source += "constant int& cnt [[buffer(4)]], ";
+      source += "constant int& row_stride [[buffer(5)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else {
       throw std::runtime_error(
           "[get_moe_kernel] Unknown kernel base name: " + base_name);

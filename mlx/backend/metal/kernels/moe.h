@@ -127,3 +127,64 @@ template <typename T>
     output[static_cast<long>(n) * D + d] = original[static_cast<long>(n) * D + d];
   }
 }
+
+// Kernel 5: moe_packet_gather
+// Gathers rows from a source buffer into packet format with 16B headers.
+// Each packet row = [header(16B) | payload(D*sizeof(T)) | pad] aligned to row_stride.
+// Used for dispatch remote pack and combine response pack.
+//
+// Grid: (D, cnt, 1)
+// Group: (min(D, 256), 1, 1)
+template <typename T>
+[[kernel]] void moe_packet_gather(
+    const device T* source         [[buffer(0)]],  // flat source [rows, D]
+    device uint8_t* packet         [[buffer(1)]],  // [cnt, row_stride]
+    const device int* src_idx      [[buffer(2)]],  // [cnt] source row indices
+    const device uint32_t* headers [[buffer(3)]],  // [cnt] header values
+    constant int& D                [[buffer(4)]],
+    constant int& cnt              [[buffer(5)]],
+    constant int& row_stride       [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  int d = gid.x;
+  int i = gid.y;
+  if (d >= D || i >= cnt) return;
+
+  long pkt_base = (long)i * row_stride;
+
+  // Write header into 16B-aligned region (first thread per row only)
+  if (d == 0) {
+    *reinterpret_cast<device uint32_t*>(packet + pkt_base) = headers[i];
+  }
+
+  // Write payload at offset 16 (aligned for vectorized access)
+  int row = src_idx[i];
+  device T* payload = reinterpret_cast<device T*>(packet + pkt_base + 16);
+  payload[d] = source[(long)row * D + d];
+}
+
+// Kernel 6: moe_packet_scatter
+// Scatters payload from packet format into a target buffer.
+// Each packet row = [header(16B) | payload(D*sizeof(T)) | pad].
+// flat_idx provides the destination row index in the target buffer.
+//
+// Grid: (D, cnt, 1)
+// Group: (min(D, 256), 1, 1)
+template <typename T>
+[[kernel]] void moe_packet_scatter(
+    const device uint8_t* packet   [[buffer(0)]],  // [cnt, row_stride]
+    device T* target               [[buffer(1)]],  // flat target buffer
+    const device int* flat_idx     [[buffer(2)]],  // [cnt] target row indices
+    constant int& D                [[buffer(3)]],
+    constant int& cnt              [[buffer(4)]],
+    constant int& row_stride       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  int d = gid.x;
+  int i = gid.y;
+  if (d >= D || i >= cnt) return;
+
+  long pkt_base = (long)i * row_stride;
+  // Read payload at offset 16 (aligned)
+  const device T* payload = reinterpret_cast<const device T*>(packet + pkt_base + 16);
+  int out_idx = flat_idx[i];
+  target[(long)out_idx * D + d] = payload[d];
+}
