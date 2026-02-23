@@ -138,6 +138,59 @@ template <typename T>
   }
 }
 
+// Kernel 4b: moe_combine_weighted_sum_dual_src
+// Zero-copy variant that reads from two separate source buffers (local
+// expert_out and remote response buffer) instead of requiring a unified
+// memcpy'd buffer. src_which[nk] = 0 for local, 1 for remote, -1 to skip.
+//
+// Grid: (D_ceil, N, 1)
+// Group: (min(D_ceil, 256), 1, 1)
+template <typename T>
+[[kernel]] void moe_combine_weighted_sum_dual_src(
+    const device T* local_src
+    [[buffer(0)]], // expert_out [E_local * cap_total * D]
+    const device T* remote_src [[buffer(1)]], // remote_buf [peer_res_count * D]
+    device T* output [[buffer(2)]], // [N, D]
+    const device T* original [[buffer(3)]], // [N, D] fallback
+    const device float* weights [[buffer(4)]], // [N, top_k]
+    const device int* src_idx
+    [[buffer(5)]], // [N * top_k] row index into respective buffer
+    const device int* src_which
+    [[buffer(6)]], // [N * top_k] 0=local, 1=remote, -1=skip
+    constant int& D [[buffer(7)]],
+    constant int& N [[buffer(8)]],
+    constant int& top_k [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  int d = gid.x;
+  int n = gid.y;
+  if (d >= D || n >= N)
+    return;
+
+  float accum = 0.0f;
+  bool has_valid = false;
+
+  for (int k = 0; k < top_k; k++) {
+    int nk = n * top_k + k;
+    int which = src_which[nk];
+    if (which < 0)
+      continue;
+    has_valid = true;
+    int idx = src_idx[nk];
+    float w = weights[nk];
+    float val = (which == 0)
+        ? static_cast<float>(local_src[static_cast<long>(idx) * D + d])
+        : static_cast<float>(remote_src[static_cast<long>(idx) * D + d]);
+    accum += w * val;
+  }
+
+  if (has_valid) {
+    output[static_cast<long>(n) * D + d] = static_cast<T>(accum);
+  } else {
+    output[static_cast<long>(n) * D + d] =
+        original[static_cast<long>(n) * D + d];
+  }
+}
+
 // Kernel 5: moe_packet_gather
 // Gathers rows from a source buffer into packet format with 16B headers.
 // Each packet row = [header(16B) | payload(D*sizeof(T)) | pad] aligned to

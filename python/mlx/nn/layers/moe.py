@@ -372,14 +372,6 @@ class MixtureOfExperts(Module):
             ``"cpu"``, or ``"metal"``. ``"auto"`` selects based on workload
             size. Only used when ``ep_impl`` is ``"cpp"`` or ``"auto"`` with
             C++ path active. Default: ``"auto"``.
-
-    Limitations:
-        - Inference only: VJP/backward not implemented for C++ fused
-          dispatch/combine primitives.
-        - ws=2 optimized: world_size > 2 automatically downgrades Metal to
-          CPU backend and uses the fixed all_to_all CPU path (one-time
-          warning emitted).
-        - Expert parallelism is opt-in via ``ep_impl="cpp"`` parameter.
     """
 
     def __init__(
@@ -527,8 +519,115 @@ class MixtureOfExperts(Module):
 
         return output, aux_loss
 
+    def _get_stacked_weights(self):
+        """Get stacked weights for batched computation, cached for reuse."""
+        if not hasattr(self, "_cached_stacked") or self._cached_stacked is None:
+            # Linear stores weight as [out, in], need [E, in, out] for x @ w
+            self._cached_stacked = (
+                mx.stack([e.w_gate.weight for e in self.experts]).swapaxes(
+                    -1, -2
+                ),  # [E, D, expert_dim]
+                mx.stack([e.w_up.weight for e in self.experts]).swapaxes(
+                    -1, -2
+                ),  # [E, D, expert_dim]
+                mx.stack([e.w_down.weight for e in self.experts]).swapaxes(
+                    -1, -2
+                ),  # [E, expert_dim, D]
+            )
+        return self._cached_stacked
+
+    def update(self, *args, **kwargs):
+        """Override to invalidate stacked weight cache on parameter update."""
+        self._cached_stacked = None
+        return super().update(*args, **kwargs)
+
+    def _run_local_experts_batched(self, dispatched: mx.array) -> mx.array:
+        """Full-stack batched 3D matmul expert computation.
+
+        Replaces 3*E sequential matmuls with 3 batched matmuls.
+        Uses cached stacked weights. Best for E_local <= 64.
+        dispatched: [E_local, cap_total, D]
+        """
+        w_gate, w_up, w_down = self._get_stacked_weights()
+        # [E, cap, D] @ [E, D, expert_dim] -> [E, cap, expert_dim]
+        gate = dispatched @ w_gate
+        up = dispatched @ w_up
+        h = silu(gate) * up
+        # [E, cap, expert_dim] @ [E, expert_dim, D] -> [E, cap, D]
+        return h @ w_down
+
+    def _run_local_experts_batched_chunked(
+        self, dispatched: mx.array, chunk_e: int
+    ) -> mx.array:
+        """Chunked batched 3D matmul — processes experts in groups of chunk_e.
+
+        Avoids stacking all E_local weights at once, reducing peak memory from
+        full_stack_extra to approximately full_stack_extra * (chunk_e / E_local).
+
+        Uses per-chunk mx.eval() to force immediate execution and memory release
+        of each chunk's stacked weight temporaries. Without this, MLX's lazy
+        evaluation would keep all chunks alive simultaneously.
+
+        Args:
+            dispatched: [E_local, cap_total, D] dispatched inputs.
+            chunk_e: Number of experts to batch together per chunk.
+
+        Returns:
+            [E_local, cap_total, D] expert outputs.
+        """
+        E_local = len(self.experts)
+        chunks = []
+        for start in range(0, E_local, chunk_e):
+            end = min(start + chunk_e, E_local)
+            chunk_experts = self.experts[start:end]
+
+            # Stack weights for this chunk only (temporary, not cached)
+            w_gate = mx.stack([e.w_gate.weight for e in chunk_experts]).swapaxes(-1, -2)
+            w_up = mx.stack([e.w_up.weight for e in chunk_experts]).swapaxes(-1, -2)
+            w_down = mx.stack([e.w_down.weight for e in chunk_experts]).swapaxes(-1, -2)
+
+            d_chunk = dispatched[start:end]  # [chunk_e, cap_total, D]
+            gate = d_chunk @ w_gate
+            up = d_chunk @ w_up
+            h = silu(gate) * up
+            out = h @ w_down
+
+            # Force evaluation so stacked weight temporaries can be freed
+            # before the next chunk is allocated. This is critical for
+            # memory savings — without it, lazy eval keeps all chunks alive.
+            mx.eval(out)
+            chunks.append(out)
+
+        return mx.concatenate(chunks, axis=0)
+
+    def _run_local_experts_gather_mm(self, dispatched: mx.array) -> mx.array:
+        """gather_mm expert computation for A/B comparison.
+
+        Note: Since dispatched is already grouped by expert as [E, cap, D],
+        gather_mm reduces to standard batched matmul. This path exists for
+        completeness; use 'batched' mode for the same result.
+        """
+        w_gate, w_up, w_down = self._get_stacked_weights()
+        # dispatched: [E, cap, D], weights: [E, D, edim] or [E, edim, D]
+        # Standard batched matmul when groups are already aligned
+        gate = mx.gather_mm(dispatched, w_gate)
+        up = mx.gather_mm(dispatched, w_up)
+        h = silu(gate) * up
+        return mx.gather_mm(h, w_down)
+
     def _run_local_experts(self, dispatched: mx.array) -> mx.array:
         """Run local experts on dispatched tokens.
+
+        Mode controlled by MLX_MOE_EP_LOCAL_FFN env var:
+          'loop': sequential expert loop
+          'batched' (default): batched 3D matmul with cached stacked weights
+          'chunked': chunked batched (per-chunk stacking with mx.eval)
+          'gather_mm': gather_mm approach
+
+        For 'batched' mode, E_local > 64 falls back to 'loop' because
+        stacking all weights doubles memory (e.g. 225GB → 450GB at K2.5).
+        The 'chunked' mode can be used explicitly with MLX_MOE_EP_LOCAL_FFN_CHUNK_E
+        but is slower than loop due to per-call mx.stack copy overhead.
 
         Args:
             dispatched: [experts_per_device, capacity_total, D] dispatched inputs.
@@ -536,6 +635,26 @@ class MixtureOfExperts(Module):
         Returns:
             [experts_per_device, capacity_total, D] expert outputs.
         """
+        import os
+
+        mode = os.environ.get("MLX_MOE_EP_LOCAL_FFN", "batched")
+
+        E_local = len(self.experts)
+
+        if mode == "batched":
+            if E_local <= 64:
+                return self._run_local_experts_batched(dispatched)
+            else:
+                # Full stacking doubles memory; fall back to loop.
+                mode = "loop"
+
+        if mode == "chunked":
+            chunk_e = int(os.environ.get("MLX_MOE_EP_LOCAL_FFN_CHUNK_E", "32"))
+            return self._run_local_experts_batched_chunked(dispatched, chunk_e)
+        elif mode == "gather_mm":
+            return self._run_local_experts_gather_mm(dispatched)
+
+        # loop: sequential (default for E_local > 64)
         outputs = []
         for i, expert in enumerate(self.experts):
             expert_input = dispatched[i]  # [capacity_total, D]

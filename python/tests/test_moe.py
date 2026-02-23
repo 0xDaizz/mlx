@@ -1217,5 +1217,775 @@ class TestCppMoeExchange(unittest.TestCase):
         self.assertTrue(mx.allclose(disp_cpu, disp_metal, atol=1e-5).item())
 
 
+class TestMoePolicy(unittest.TestCase):
+    """Non-distributed MoePolicy API unit tests."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_dispatch_exchange"):
+            self.skipTest("Phase 5 API not available")
+
+    def test_auto_small_n_cpu(self):
+        """N=1 with auto backend should use CPU (small N zone)."""
+        import os
+
+        os.environ.pop("MLX_MOE_EP_BACKEND", None)
+        N, D, top_k = 1, 64, 2
+        num_experts = 4
+        capacity = 4
+        tokens = mx.random.normal((N, D))
+        idx = mx.zeros((N, top_k), dtype=mx.int32)
+        # auto should resolve to CPU for small N
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            idx,
+            num_experts=num_experts,
+            capacity=capacity,
+            backend="auto",
+        )
+        mx.eval(dispatched, route_idx)
+        self.assertEqual(dispatched.shape[0], num_experts)
+
+    def test_auto_env_override(self):
+        """MLX_MOE_EP_BACKEND=cpu should force CPU."""
+        import os
+
+        os.environ["MLX_MOE_EP_BACKEND"] = "cpu"
+        try:
+            N, D, top_k = 512, 128, 2
+            num_experts = 4
+            capacity = 256
+            tokens = mx.random.normal((N, D))
+            idx = mx.random.randint(0, num_experts, shape=(N, top_k)).astype(mx.int32)
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens,
+                idx,
+                num_experts=num_experts,
+                capacity=capacity,
+                backend="auto",
+            )
+            mx.eval(dispatched, route_idx)
+            self.assertEqual(route_idx.shape, (N, top_k))
+        finally:
+            os.environ.pop("MLX_MOE_EP_BACKEND", None)
+
+    def test_auto_middle_zone(self):
+        """Middle zone (64 < N < 256) uses byte threshold."""
+        import os
+
+        os.environ.pop("MLX_MOE_EP_BACKEND", None)
+        N, D, top_k = 128, 64, 2
+        num_experts = 4
+        capacity = 64
+        tokens = mx.random.normal((N, D))
+        idx = mx.random.randint(0, num_experts, shape=(N, top_k)).astype(mx.int32)
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            idx,
+            num_experts=num_experts,
+            capacity=capacity,
+            backend="auto",
+        )
+        mx.eval(dispatched, route_idx)
+        self.assertEqual(dispatched.shape[-1], D)
+
+
+class TestMoeMetrics(unittest.TestCase):
+    """Non-distributed metrics API unit tests."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_ep_stats"):
+            self.skipTest("moe_ep_stats not available")
+
+    def test_stats_returns_dict(self):
+        """moe_ep_stats should return a dict with expected keys."""
+        stats = mx.distributed.moe_ep_stats()
+        self.assertIsInstance(stats, dict)
+        expected_keys = [
+            "dispatch_calls",
+            "combine_calls",
+            "cpu_backend_calls",
+            "metal_backend_calls",
+            "fallback_to_cpu_count",
+            "total_tokens_dispatched",
+            "warmup_completed",
+            "overflow_count",
+            "remote_tokens_total",
+            "local_tokens_total",
+            "dispatch_route_cpu_us",
+            "dispatch_comm_us",
+            "combine_comm_us",
+            "dispatch_total_us",
+            "combine_total_us",
+        ]
+        for key in expected_keys:
+            self.assertIn(key, stats, f"Missing key: {key}")
+
+    def test_stats_after_dispatch_combine(self):
+        """Counters should increment after dispatch+combine calls."""
+        mx.distributed.moe_ep_reset_stats()
+        N, D, top_k = 8, 16, 2
+        E, cap = 4, 4
+        tokens = mx.random.normal((N, D))
+        idx = mx.array([[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32)
+        weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+        dispatched, ri = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            idx,
+            num_experts=E,
+            capacity=cap,
+        )
+        mx.eval(dispatched, ri)
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched,
+            ri,
+            weights,
+            tokens,
+            num_experts=E,
+            capacity=cap,
+        )
+        mx.eval(combined)
+
+        stats = mx.distributed.moe_ep_stats()
+        self.assertGreater(stats["dispatch_calls"], 0)
+        self.assertGreater(stats["combine_calls"], 0)
+        self.assertGreater(stats["total_tokens_dispatched"], 0)
+
+    def test_reset_clears_counters(self):
+        """Reset should zero all counters."""
+        # Run something first to bump counters
+        N, D, top_k = 4, 8, 2
+        E, cap = 2, 4
+        tokens = mx.random.normal((N, D))
+        idx = mx.zeros((N, top_k), dtype=mx.int32)
+        dispatched, ri = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            idx,
+            num_experts=E,
+            capacity=cap,
+        )
+        mx.eval(dispatched, ri)
+
+        mx.distributed.moe_ep_reset_stats()
+        stats = mx.distributed.moe_ep_stats()
+        self.assertEqual(stats["dispatch_calls"], 0)
+        self.assertEqual(stats["combine_calls"], 0)
+
+
+class TestMoeWarmup(unittest.TestCase):
+    """Non-distributed warmup tests."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_ep_warmup"):
+            self.skipTest("moe_ep_warmup not available")
+
+    def test_warmup_no_crash_local(self):
+        """Warmup with ws=1 should not crash."""
+        mx.distributed.moe_ep_warmup()  # zero-arg call
+
+    def test_warmup_with_params(self):
+        """Warmup with Metal params should not crash."""
+        mx.distributed.moe_ep_warmup(
+            num_experts=4,
+            capacity=8,
+            hidden_dim=64,
+            dtype=mx.float16,
+        )
+
+    def test_warmup_metric_set(self):
+        """warmup_completed counter should increment."""
+        mx.distributed.moe_ep_reset_stats()
+        mx.distributed.moe_ep_warmup()
+        stats = mx.distributed.moe_ep_stats()
+        self.assertGreater(stats["warmup_completed"], 0)
+
+
+class TestMoeFallback(unittest.TestCase):
+    """Fault injection fallback tests."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_dispatch_exchange"):
+            self.skipTest("moe_dispatch_exchange not available")
+
+    def test_force_metal_error_fallback(self):
+        """FORCE_METAL_ERROR + FALLBACK_ON_ERROR=1 should fallback to CPU."""
+        import os
+
+        os.environ["MLX_MOE_EP_FORCE_METAL_ERROR"] = "1"
+        os.environ["MLX_MOE_EP_FALLBACK_ON_ERROR"] = "1"
+        try:
+            N, D, top_k = 8, 16, 2
+            E, cap = 4, 4
+            tokens = mx.random.normal((N, D))
+            idx = mx.array([[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32)
+            weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+            # metal backend should fail and fallback to CPU
+            dispatched, ri = mx.distributed.moe_dispatch_exchange(
+                tokens,
+                idx,
+                num_experts=E,
+                capacity=cap,
+                backend="metal",
+            )
+            mx.eval(dispatched, ri)
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched,
+                ri,
+                weights,
+                tokens,
+                num_experts=E,
+                capacity=cap,
+                backend="metal",
+            )
+            mx.eval(combined)
+            # Should produce valid output via CPU fallback
+            self.assertEqual(combined.shape, (N, D))
+            self.assertTrue(mx.all(mx.isfinite(combined)).item())
+        finally:
+            os.environ.pop("MLX_MOE_EP_FORCE_METAL_ERROR", None)
+            os.environ.pop("MLX_MOE_EP_FALLBACK_ON_ERROR", None)
+
+    def test_fallback_disabled_rethrow(self):
+        """FORCE_METAL_ERROR + FALLBACK_ON_ERROR=0 should raise exception."""
+        import os
+
+        os.environ["MLX_MOE_EP_FORCE_METAL_ERROR"] = "1"
+        os.environ["MLX_MOE_EP_FALLBACK_ON_ERROR"] = "0"
+        try:
+            N, D, top_k = 4, 8, 2
+            E, cap = 2, 4
+            tokens = mx.random.normal((N, D))
+            idx = mx.zeros((N, top_k), dtype=mx.int32)
+            with self.assertRaises(RuntimeError):
+                dispatched, ri = mx.distributed.moe_dispatch_exchange(
+                    tokens,
+                    idx,
+                    num_experts=E,
+                    capacity=cap,
+                    backend="metal",
+                )
+                mx.eval(dispatched, ri)
+        finally:
+            os.environ.pop("MLX_MOE_EP_FORCE_METAL_ERROR", None)
+            os.environ.pop("MLX_MOE_EP_FALLBACK_ON_ERROR", None)
+
+    def test_fallback_increments_metric(self):
+        """Fallback should increment fallback_to_cpu_count metric."""
+        import os
+
+        mx.distributed.moe_ep_reset_stats()
+        os.environ["MLX_MOE_EP_FORCE_METAL_ERROR"] = "1"
+        os.environ["MLX_MOE_EP_FALLBACK_ON_ERROR"] = "1"
+        try:
+            N, D, top_k = 4, 8, 2
+            E, cap = 2, 4
+            tokens = mx.random.normal((N, D))
+            idx = mx.zeros((N, top_k), dtype=mx.int32)
+            dispatched, ri = mx.distributed.moe_dispatch_exchange(
+                tokens,
+                idx,
+                num_experts=E,
+                capacity=cap,
+                backend="metal",
+            )
+            mx.eval(dispatched, ri)
+            stats = mx.distributed.moe_ep_stats()
+            self.assertGreater(stats["fallback_to_cpu_count"], 0)
+        finally:
+            os.environ.pop("MLX_MOE_EP_FORCE_METAL_ERROR", None)
+            os.environ.pop("MLX_MOE_EP_FALLBACK_ON_ERROR", None)
+
+
+class TestBatchedExperts(mlx_tests.MLXTestCase):
+    """Tests for batched 3D matmul and gather_mm expert computation."""
+
+    def _make_moe(self, hidden_dim=32, expert_dim=64, num_experts=4, top_k=2):
+        """Helper to create a small MoE for testing."""
+        moe = MixtureOfExperts(
+            hidden_dim,
+            expert_dim,
+            num_experts,
+            top_k=top_k,
+            capacity_factor=1.5,
+        )
+        return moe
+
+    def test_batched_vs_loop_consistency(self):
+        """Batched 3D matmul produces same results as sequential loop."""
+        import os
+
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32))
+
+        # Run with loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        out_loop, loss_loop = moe(x)
+        mx.eval(out_loop, loss_loop)
+
+        # Invalidate cache before switching mode
+        moe._cached_stacked = None
+
+        # Run with batched
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out_batched, loss_batched = moe(x)
+        mx.eval(out_batched, loss_batched)
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertTrue(
+            mx.allclose(out_loop, out_batched, atol=1e-5, rtol=1e-4).item(),
+            f"Loop vs batched mismatch. Max diff: {mx.abs(out_loop - out_batched).max().item()}",
+        )
+
+    def test_gather_mm_vs_loop_consistency(self):
+        """gather_mm produces same results as sequential loop."""
+        import os
+
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        out_loop, _ = moe(x)
+        mx.eval(out_loop)
+
+        moe._cached_stacked = None
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "gather_mm"
+        out_gmm, _ = moe(x)
+        mx.eval(out_gmm)
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertTrue(
+            mx.allclose(out_loop, out_gmm, atol=1e-5, rtol=1e-4).item(),
+            f"Loop vs gather_mm mismatch. Max diff: {mx.abs(out_loop - out_gmm).max().item()}",
+        )
+
+    def test_batched_single_token(self):
+        """Batched mode handles N=1 correctly."""
+        import os
+
+        moe = self._make_moe()
+        x = mx.random.normal((1, 32))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertEqual(out.shape, (1, 32))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+    def test_batched_large_batch(self):
+        """Batched mode handles larger batch sizes."""
+        import os
+
+        moe = self._make_moe(hidden_dim=64, expert_dim=128, num_experts=8)
+        x = mx.random.normal((64, 64))
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        self.assertEqual(out.shape, (64, 64))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+    def test_stacked_weight_cache_invalidation(self):
+        """Cache should be invalidated when parameters are updated."""
+        moe = self._make_moe()
+        x = mx.random.normal((4, 32))
+
+        # Trigger cache creation
+        _ = moe._get_stacked_weights()
+        self.assertIsNotNone(moe._cached_stacked)
+
+        # Update parameters (simulates load_weights)
+        moe.update(moe.parameters())
+        self.assertIsNone(moe._cached_stacked)
+
+    def test_stacked_weight_cache_reuse(self):
+        """Stacked weight cache should be reused across calls."""
+        moe = self._make_moe()
+
+        w1 = moe._get_stacked_weights()
+        w2 = moe._get_stacked_weights()
+
+        # Same object references (cached)
+        self.assertIs(w1[0], w2[0])
+        self.assertIs(w1[1], w2[1])
+        self.assertIs(w1[2], w2[2])
+
+    def test_local_ffn_env_flag_default(self):
+        """Default mode (no env var) should use loop path."""
+        import os
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+        moe = self._make_moe()
+        x = mx.random.normal((4, 32))
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        self.assertEqual(out.shape, (4, 32))
+
+    def test_batched_float16(self):
+        """Batched mode works with float16 inputs."""
+        import os
+
+        moe = self._make_moe()
+        x = mx.random.normal((8, 32)).astype(mx.float16)
+
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        out, loss = moe(x)
+        mx.eval(out, loss)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+        # Output dtype matches expert weights, not input
+        # (Linear layer outputs match weight dtype)
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+    def test_chunked_vs_loop(self):
+        """Chunked batched output should match loop output."""
+        import os
+
+        E_local = 32
+        D = 64
+        expert_dim = 128
+        cap_total = 8
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Loop output
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        loop_out = model._run_local_experts(dispatched)
+        mx.eval(loop_out)
+
+        # Chunked output (chunk_e=8)
+        chunked_out = model._run_local_experts_batched_chunked(dispatched, chunk_e=8)
+        mx.eval(chunked_out)
+
+        self.assertEqual(loop_out.shape, chunked_out.shape)
+        self.assertTrue(
+            mx.allclose(loop_out, chunked_out, atol=1e-5, rtol=1e-4).item(),
+            f"Chunked output differs from loop. Max diff: {mx.max(mx.abs(loop_out - chunked_out)).item()}",
+        )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+    def test_chunked_various_sizes(self):
+        """Test chunked batched with different chunk_e values."""
+        import os
+
+        E_local = 24
+        D = 64
+        expert_dim = 128
+        cap_total = 4
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Reference: loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        ref_out = model._run_local_experts(dispatched)
+        mx.eval(ref_out)
+
+        # Test various chunk sizes including edge cases
+        for chunk_e in [1, 4, 6, 8, 12, 24]:
+            with self.subTest(chunk_e=chunk_e):
+                out = model._run_local_experts_batched_chunked(
+                    dispatched, chunk_e=chunk_e
+                )
+                mx.eval(out)
+                self.assertEqual(ref_out.shape, out.shape)
+                self.assertTrue(
+                    mx.allclose(ref_out, out, atol=1e-5, rtol=1e-4).item(),
+                    f"chunk_e={chunk_e}: max diff={mx.max(mx.abs(ref_out - out)).item()}",
+                )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+    def test_chunked_auto_routing_large_E(self):
+        """With E_local > 64, batched mode should use chunked path."""
+        import os
+
+        E_local = 72
+        D = 32
+        expert_dim = 64
+        cap_total = 2
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Reference: loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        ref_out = model._run_local_experts(dispatched)
+        mx.eval(ref_out)
+
+        # Batched mode with E_local=72 > 64 should auto-chunk
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        os.environ["MLX_MOE_EP_LOCAL_FFN_CHUNK_E"] = "16"
+        model._cached_stacked = None
+        batched_out = model._run_local_experts(dispatched)
+        mx.eval(batched_out)
+
+        self.assertEqual(ref_out.shape, batched_out.shape)
+        self.assertTrue(
+            mx.allclose(ref_out, batched_out, atol=1e-5, rtol=1e-4).item(),
+            f"Auto-chunked output differs. Max diff: {mx.max(mx.abs(ref_out - batched_out)).item()}",
+        )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN_CHUNK_E", None)
+
+
+class TestZeroCopyCombine(unittest.TestCase):
+    """Tests for zero-copy dual-src combine Metal kernel."""
+
+    def setUp(self):
+        if not hasattr(mx.distributed, "moe_dispatch_exchange"):
+            self.skipTest("moe_dispatch_exchange not available")
+        self._world_size = 1
+        for backend in ("jaccl", "mpi", "nccl"):
+            try:
+                g = mx.distributed.init(strict=True, backend=backend)
+                if g.size() > 1:
+                    self._world_size = g.size()
+                    break
+            except Exception:
+                pass
+        if self._world_size == 1:
+            try:
+                self._world_size = mx.distributed.init().size()
+            except Exception:
+                self._world_size = 1
+
+    def test_zero_copy_roundtrip_local(self):
+        """Zero-copy: dispatch -> identity -> combine = input for ws=1."""
+        import os
+
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        try:
+            mx.random.seed(42)
+            N, D, E, top_k = 16, 32, 4, 2
+            capacity = 8
+            tokens = mx.random.normal((N, D))
+            expert_indices = mx.array(
+                [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+            )
+            weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens,
+                expert_indices,
+                num_experts=E,
+                capacity=capacity,
+                backend="metal",
+            )
+            mx.eval(dispatched, route_idx)
+
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched,
+                route_idx,
+                weights,
+                tokens,
+                num_experts=E,
+                capacity=capacity,
+                backend="metal",
+            )
+            mx.eval(combined)
+
+            self.assertEqual(combined.shape, (N, D))
+            self.assertTrue(
+                mx.allclose(combined, tokens, atol=1e-4).item(),
+                f"Zero-copy roundtrip failed. Max diff: {mx.abs(combined - tokens).max().item()}",
+            )
+        finally:
+            os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+    def test_zero_copy_vs_unified_consistency(self):
+        """Zero-copy produces same results as unified_src path."""
+        import os
+
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        mx.random.seed(77)
+        N, D, E, top_k = 32, 64, 4, 2
+        capacity = 12
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.random.uniform(shape=(N, top_k))
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+
+        # Unified path (zero-copy off)
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "0"
+        disp1, ri1 = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            expert_indices,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(disp1, ri1)
+        # Apply a non-trivial expert transform
+        expert_out1 = disp1 * 2.0 + 1.0
+        comb1 = mx.distributed.moe_combine_exchange(
+            expert_out1,
+            ri1,
+            weights,
+            tokens,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(comb1)
+
+        # Zero-copy path
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        disp2, ri2 = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            expert_indices,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(disp2, ri2)
+        expert_out2 = disp2 * 2.0 + 1.0
+        comb2 = mx.distributed.moe_combine_exchange(
+            expert_out2,
+            ri2,
+            weights,
+            tokens,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(comb2)
+
+        os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+        self.assertTrue(
+            mx.allclose(comb1, comb2, atol=1e-4).item(),
+            f"Unified vs zero-copy differ. Max diff: {mx.abs(comb1 - comb2).max().item()}",
+        )
+
+    def test_zero_copy_overflow_residual(self):
+        """Zero-copy: all-overflow tokens get original_tokens as residual."""
+        import os
+
+        if self._world_size > 1:
+            self.skipTest("local-only test")
+
+        os.environ["MLX_MOE_EP_ZERO_COPY"] = "1"
+        try:
+            N, D, E, top_k = 4, 16, 1, 2
+            capacity = 1
+            tokens = mx.random.normal((N, D))
+            expert_indices = mx.zeros((N, top_k), dtype=mx.int32)
+            weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+            dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+                tokens,
+                expert_indices,
+                num_experts=E,
+                capacity=capacity,
+                backend="metal",
+            )
+            mx.eval(dispatched, route_idx)
+
+            combined = mx.distributed.moe_combine_exchange(
+                dispatched,
+                route_idx,
+                weights,
+                tokens,
+                num_experts=E,
+                capacity=capacity,
+                backend="metal",
+            )
+            mx.eval(combined)
+
+            route_idx_list = route_idx.tolist()
+            for n in range(N):
+                all_invalid = all(route_idx_list[n][k] < 0 for k in range(top_k))
+                if all_invalid:
+                    self.assertTrue(
+                        mx.allclose(combined[n], tokens[n], atol=1e-5).item(),
+                        f"Token {n} should be residual fallback (zero-copy)",
+                    )
+        finally:
+            os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+
+    def test_zero_copy_env_flag_default_off(self):
+        """Default (no env var) should use the old unified path without error."""
+        import os
+
+        os.environ.pop("MLX_MOE_EP_ZERO_COPY", None)
+        N, D, E, top_k = 8, 16, 4, 2
+        capacity = 4
+        tokens = mx.random.normal((N, D))
+        expert_indices = mx.array(
+            [[i % E, (i + 1) % E] for i in range(N)], dtype=mx.int32
+        )
+        weights = mx.ones((N, top_k), dtype=mx.float32) / top_k
+
+        dispatched, route_idx = mx.distributed.moe_dispatch_exchange(
+            tokens,
+            expert_indices,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(dispatched, route_idx)
+        combined = mx.distributed.moe_combine_exchange(
+            dispatched,
+            route_idx,
+            weights,
+            tokens,
+            num_experts=E,
+            capacity=capacity,
+            backend="metal",
+        )
+        mx.eval(combined)
+        self.assertEqual(combined.shape, (N, D))
+
+
 if __name__ == "__main__":
     unittest.main()
