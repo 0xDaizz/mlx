@@ -15,16 +15,17 @@ Kimi K2.5 scale defaults: E=384, top_k=8, D=7168, capacity_factor=1.25, dtype=fl
 
 Run:
     mlx.launch --backend jaccl --hostfile hosts.json -- \\
-        python3 benchmarks/python/moe_ep_phase5_bench.py --warmup 10 --iters 30
+        python3 benchmarks/python/moe_ep_phase5_bench.py
 
 Options:
-    --warmup N      warmup iterations before timing (default 5)
-    --iters N       timing iterations (default 20)
+    --warmup N      warmup iterations before timing (default 10)
+    --iters N       timing iterations (default 30)
     --soak N        soak test iterations, 0 = skip (default 0)
     --E N           total number of experts (default 384)
     --D N           hidden dimension (default 7168)
     --top_k N       top-k experts per token (default 8)
-    --capacity N    per-expert capacity (default 32)
+    --cf F          capacity factor for dynamic cap (default 1.25)
+    --capacity N    fixed per-expert capacity; 0 = dynamic (default 0)
 """
 
 import argparse
@@ -43,7 +44,7 @@ import mlx.core as mx
 
 
 def time_fn(fn, warmup, iters):
-    """Time a function, returning (mean_ms, std_ms, min_ms, all_times).
+    """Time a function, returning (median_ms, p90_ms, min_ms, all_times).
 
     CRITICAL: mx.synchronize() is called INSIDE the warmup loop to ensure
     each warmup iteration fully completes before the next one starts.
@@ -68,8 +69,8 @@ def time_fn(fn, warmup, iters):
         mx.synchronize()
         ts.append((time.perf_counter() - t0) * 1e3)
     return (
-        float(np.mean(ts)),
-        float(np.std(ts)),
+        float(np.median(ts)),
+        float(np.percentile(ts, 90)),
         float(np.min(ts)),
         ts,
     )
@@ -100,6 +101,11 @@ def geomean(values):
     if not valid:
         return float("nan")
     return float(np.exp(np.mean(np.log(valid))))
+
+
+def compute_capacity(N, top_k, cf, E):
+    """Compute per-expert capacity."""
+    return max(1, math.ceil(N * top_k * cf / E))
 
 
 def check_nan_inf(arr):
@@ -235,9 +241,13 @@ def make_dispatch_combine_fn(tokens, expert_indices, weights_f32,
     return fn
 
 
-def run_backend_comparison(group, E, D, top_k, capacity, dtype,
+def run_backend_comparison(group, E, D, top_k, cf, capacity, dtype,
                            warmup, iters, rank):
-    """Suite 1: Compare auto, cpu, metal backends across N values."""
+    """Suite 1: Compare auto, cpu, metal backends across N values.
+
+    Args:
+        capacity: 0 = dynamic (compute per-N using cf), >0 = fixed.
+    """
     N_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
     has_cpp = hasattr(mx.distributed, "moe_dispatch_exchange")
@@ -253,11 +263,22 @@ def run_backend_comparison(group, E, D, top_k, capacity, dtype,
         print("Suite 1: Auto vs CPU vs Metal Backend Comparison")
         print("=" * 90)
 
-    # Collect results: list of (N, backend, mean, std, min)
+    # Collect results: list of (N, cap, backend, med, p90, min)
     all_results = []
 
     for N in N_VALUES:
         barrier(group)
+
+        # Resolve capacity for this N
+        if capacity == 0:
+            cap_n = compute_capacity(N, top_k, cf, E)
+        else:
+            cap_n = capacity
+        # Synchronize capacity across ranks
+        cap_arr = mx.array(cap_n, dtype=mx.int32)
+        cap_arr = mx.distributed.all_max(cap_arr, group=group)
+        mx.eval(cap_arr)
+        cap_n = cap_arr.item()
 
         # Allocate inputs
         tokens = mx.random.normal((N, D)).astype(dtype)
@@ -267,19 +288,19 @@ def run_backend_comparison(group, E, D, top_k, capacity, dtype,
         mx.eval(tokens, expert_indices, weights)
 
         if rank == 0:
-            print(f"  N={N:>5d} ...", end="", flush=True)
+            print(f"  N={N:>5d} cap={cap_n:>4d} ...", end="", flush=True)
 
         for backend in backends:
             barrier(group)
             try:
                 fn = make_dispatch_combine_fn(
                     tokens, expert_indices, weights,
-                    E, capacity, group, backend,
+                    E, cap_n, group, backend,
                 )
-                mean_ms, std_ms, min_ms, _ = time_fn(fn, warmup, iters)
-                all_results.append((N, backend, mean_ms, std_ms, min_ms))
+                med_ms, p90_ms, min_ms, _ = time_fn(fn, warmup, iters)
+                all_results.append((N, cap_n, backend, med_ms, p90_ms, min_ms))
             except Exception as ex:
-                all_results.append((N, backend, float("nan"), float("nan"), float("nan")))
+                all_results.append((N, cap_n, backend, float("nan"), float("nan"), float("nan")))
                 if rank == 0:
                     print(f" [{backend} ERR: {ex}]", end="", flush=True)
 
@@ -288,12 +309,12 @@ def run_backend_comparison(group, E, D, top_k, capacity, dtype,
 
     # Print results table on rank 0
     if rank == 0:
-        headers = ["N", "backend", "mean_ms", "std_ms", "min_ms"]
-        col_widths = [6, 8, 10, 10, 10]
-        col_formats = ["int", "str", "ms", "ms", "ms"]
+        headers = ["N", "cap", "backend", "med_ms", "p90_ms", "min_ms"]
+        col_widths = [6, 6, 8, 10, 10, 10]
+        col_formats = ["int", "int", "str", "ms", "ms", "ms"]
         rows = []
-        for N, backend, mean_ms, std_ms, min_ms in all_results:
-            rows.append([N, backend, mean_ms, std_ms, min_ms])
+        for N, cap_n, backend, med_ms, p90_ms, min_ms in all_results:
+            rows.append([N, cap_n, backend, med_ms, p90_ms, min_ms])
         print_table(
             "Backend Comparison — dispatch+combine latency (ms)",
             headers, rows, col_widths, col_formats,
@@ -305,14 +326,16 @@ def run_backend_comparison(group, E, D, top_k, capacity, dtype,
 
 def print_condensed_comparison(all_results, n_values, backends):
     """Print a condensed N x backend table with speedup columns."""
-    # Organize results into dict: (N, backend) -> mean_ms
+    # Organize results into dict: (N, backend) -> med_ms
     lookup = {}
-    for N, backend, mean_ms, _, _ in all_results:
-        lookup[(N, backend)] = mean_ms
+    cap_lookup = {}
+    for N, cap_n, backend, med_ms, _, _ in all_results:
+        lookup[(N, backend)] = med_ms
+        cap_lookup[N] = cap_n
 
-    headers = ["N", "cpu_ms", "metal_ms", "auto_ms", "cpu/mtl", "auto pick"]
-    col_widths = [6, 9, 9, 9, 8, 10]
-    col_formats = ["int", "ms", "ms", "ms", "speedup", "str"]
+    headers = ["N", "cap", "cpu_ms", "metal_ms", "auto_ms", "cpu/mtl", "auto pick"]
+    col_widths = [6, 6, 9, 9, 9, 8, 10]
+    col_formats = ["int", "int", "ms", "ms", "ms", "speedup", "str"]
 
     rows = []
     cpu_vs_mtl_all = []
@@ -340,10 +363,10 @@ def print_condensed_comparison(all_results, n_values, backends):
         else:
             auto_pick = "?"
 
-        rows.append([N, cpu_t, metal_t, auto_t, ratio, auto_pick])
+        rows.append([N, cap_lookup.get(N, 0), cpu_t, metal_t, auto_t, ratio, auto_pick])
 
     print_table(
-        "\nCondensed Comparison (mean_ms)",
+        "\nCondensed Comparison (median_ms)",
         headers, rows, col_widths, col_formats,
     )
 
@@ -355,14 +378,6 @@ def print_condensed_comparison(all_results, n_values, backends):
 
         decode_ratios = []
         prefill_ratios = []
-        for (N, mean_ms, _, _, _), _ in zip(
-            [(N, lookup.get((N, "cpu"), float("nan")),
-              lookup.get((N, "metal"), float("nan")),
-              lookup.get((N, "auto"), float("nan")), None)
-             for N in n_values],
-            n_values,
-        ):
-            pass  # handled below
 
         for N in n_values:
             cpu_t = lookup.get((N, "cpu"), float("nan"))
@@ -386,8 +401,12 @@ def print_condensed_comparison(all_results, n_values, backends):
 # ── Suite 2: Warmup test ─────────────────────────────────────────────────
 
 
-def run_warmup_test(group, E, D, top_k, capacity, dtype, rank):
-    """Suite 2: Measure first-call latency with and without moe_ep_warmup."""
+def run_warmup_test(group, E, D, top_k, cf, capacity, dtype, rank):
+    """Suite 2: Measure first-call latency with and without moe_ep_warmup.
+
+    Args:
+        capacity: 0 = dynamic (compute from cf), >0 = fixed.
+    """
     has_cpp = hasattr(mx.distributed, "moe_dispatch_exchange")
     has_warmup_api = hasattr(mx.distributed, "moe_ep_warmup")
 
@@ -407,6 +426,14 @@ def run_warmup_test(group, E, D, top_k, capacity, dtype, rank):
                   "running cold-start measurement only.\n")
 
     N_TEST = 256  # representative mid-batch size
+
+    # Resolve capacity for N_TEST
+    if capacity == 0:
+        capacity = compute_capacity(N_TEST, top_k, cf, E)
+    cap_arr = mx.array(capacity, dtype=mx.int32)
+    cap_arr = mx.distributed.all_max(cap_arr, group=group)
+    mx.eval(cap_arr)
+    capacity = cap_arr.item()
 
     # Allocate test inputs
     tokens = mx.random.normal((N_TEST, D)).astype(dtype)
@@ -558,10 +585,14 @@ def run_stats_dump(group, rank):
 # ── Suite 4: Soak test ───────────────────────────────────────────────────
 
 
-def run_soak_test(group, E, D, top_k, capacity, dtype,
+def run_soak_test(group, E, D, top_k, cf, capacity, dtype,
                   soak_iters, rank):
     """Suite 4: Soak test — run N iterations with backend='auto',
-    check outputs for NaN/Inf."""
+    check outputs for NaN/Inf.
+
+    Args:
+        capacity: 0 = dynamic (compute per-N from cf), >0 = fixed.
+    """
     has_cpp = hasattr(mx.distributed, "moe_dispatch_exchange")
     if not has_cpp:
         if rank == 0:
@@ -594,6 +625,12 @@ def run_soak_test(group, E, D, top_k, capacity, dtype,
     for it in range(soak_iters):
         N = N_CHOICES[it % len(N_CHOICES)]
 
+        # Resolve capacity for this N
+        if capacity == 0:
+            cap_n = compute_capacity(N, top_k, cf, E)
+        else:
+            cap_n = capacity
+
         tokens = mx.random.normal((N, D)).astype(dtype)
         expert_indices = mx.random.randint(0, E, shape=(N, top_k)).astype(mx.int32)
         weights_raw = mx.random.normal((N, top_k))
@@ -606,7 +643,7 @@ def run_soak_test(group, E, D, top_k, capacity, dtype,
         try:
             fn = make_dispatch_combine_fn(
                 tokens, expert_indices, weights,
-                E, capacity, group, test_backend,
+                E, cap_n, group, test_backend,
             )
             result = fn()
             mx.eval(result)
@@ -677,10 +714,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Phase 5 Inference Productionization benchmark — MoE EP"
     )
-    parser.add_argument("--warmup", type=int, default=5,
-                        help="Warmup iterations before timing (default 5)")
-    parser.add_argument("--iters", type=int, default=20,
-                        help="Timing iterations (default 20)")
+    parser.add_argument("--warmup", type=int, default=10,
+                        help="Warmup iterations before timing (default 10)")
+    parser.add_argument("--iters", type=int, default=30,
+                        help="Timing iterations (default 30)")
     parser.add_argument("--soak", type=int, default=0,
                         help="Soak test iterations, 0 = skip (default 0)")
     parser.add_argument("--E", type=int, default=384,
@@ -689,8 +726,10 @@ def main():
                         help="Hidden dimension (default 7168)")
     parser.add_argument("--top_k", type=int, default=8,
                         help="Top-k experts per token (default 8)")
-    parser.add_argument("--capacity", type=int, default=32,
-                        help="Per-expert capacity (default 32)")
+    parser.add_argument("--cf", type=float, default=1.25,
+                        help="Capacity factor (default 1.25)")
+    parser.add_argument("--capacity", type=int, default=0,
+                        help="Fixed per-expert capacity; 0 = dynamic (default 0)")
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -705,7 +744,8 @@ def main():
     E = args.E
     D = args.D
     top_k = args.top_k
-    capacity = args.capacity
+    cf = args.cf
+    fixed_capacity = args.capacity  # 0 = dynamic
     warmup = args.warmup
     iters = args.iters
     dtype = mx.float16
@@ -727,9 +767,10 @@ def main():
             commit = "unknown"
 
         print("=" * 90)
+        cap_str = f"dynamic(cf={cf})" if fixed_capacity == 0 else f"fixed={fixed_capacity}"
         print(
             f"Phase 5 Benchmark — Inference Productionization  "
-            f"(E={E}, top_k={top_k}, D={D}, cap={capacity})"
+            f"(E={E}, top_k={top_k}, D={D}, cap={cap_str})"
         )
         print(
             f"  commit={commit}  world_size={ws}  "
@@ -744,28 +785,34 @@ def main():
     # ── JACCL warmup (always needed) ────────────────────────────────────
     jaccl_warmup(group, dtype, rank)
 
-    # ── Synchronize capacity across ranks ───────────────────────────────
-    cap_arr = mx.array(capacity, dtype=mx.int32)
-    cap_arr = mx.distributed.all_max(cap_arr, group=group)
-    mx.eval(cap_arr)
-    capacity = cap_arr.item()
-
-    if rank == 0:
-        E_local = E // ws
-        print(f"  Synchronized capacity={capacity}, E_local={E_local}")
+    # ── Resolve capacity ─────────────────────────────────────────────────
+    if fixed_capacity > 0:
+        # Synchronize fixed capacity across ranks
+        cap_arr = mx.array(fixed_capacity, dtype=mx.int32)
+        cap_arr = mx.distributed.all_max(cap_arr, group=group)
+        mx.eval(cap_arr)
+        capacity = cap_arr.item()
+        if rank == 0:
+            E_local = E // ws
+            print(f"  Fixed capacity={capacity}, E_local={E_local}")
+    else:
+        capacity = 0  # sentinel: Suite 1 computes per-N
+        if rank == 0:
+            E_local = E // ws
+            print(f"  Dynamic capacity (cf={cf}), E_local={E_local}")
 
     # ── Suite 1: Backend comparison ─────────────────────────────────────
-    run_backend_comparison(group, E, D, top_k, capacity, dtype,
+    run_backend_comparison(group, E, D, top_k, cf, capacity, dtype,
                            warmup, iters, rank)
 
     # ── Suite 2: Warmup test ────────────────────────────────────────────
-    run_warmup_test(group, E, D, top_k, capacity, dtype, rank)
+    run_warmup_test(group, E, D, top_k, cf, capacity, dtype, rank)
 
     # ── Suite 3: Stats dump ─────────────────────────────────────────────
     run_stats_dump(group, rank)
 
     # ── Suite 4: Soak test ──────────────────────────────────────────────
-    run_soak_test(group, E, D, top_k, capacity, dtype,
+    run_soak_test(group, E, D, top_k, cf, capacity, dtype,
                   args.soak, rank)
 
     # ── Final stats dump (after all tests) ──────────────────────────────
@@ -784,7 +831,7 @@ def main():
         print("  auto_ms   = C++ fused dispatch+combine, auto backend selection")
         print("  cpu/mtl   = cpu_time / metal_time (>1 = Metal faster)")
         print("  auto pick = inferred backend choice for auto mode")
-        print(f"  All times in milliseconds (mean of {iters} iterations)")
+        print(f"  All times in milliseconds (median of {iters} iterations)")
         print("=" * 90)
 
     barrier(group)

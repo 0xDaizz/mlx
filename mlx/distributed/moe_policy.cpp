@@ -65,7 +65,7 @@ MoeBackend MoePolicy::resolve(int N, int top_k, int D, int elem_size) {
   }
 
   // 6. Zone 2: large N -> Metal
-  int64_t gpu_n_min = env_int("MLX_MOE_EP_GPU_N_MIN", 256);
+  int64_t gpu_n_min = env_int("MLX_MOE_EP_GPU_N_MIN", 320);
   if (N >= gpu_n_min) {
     return MoeBackend::Metal;
   }
