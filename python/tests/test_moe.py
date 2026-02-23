@@ -1425,6 +1425,128 @@ class TestBatchedExperts(mlx_tests.MLXTestCase):
         # (Linear layer outputs match weight dtype)
         self.assertTrue(mx.all(mx.isfinite(out)).item())
 
+    def test_chunked_vs_loop(self):
+        """Chunked batched output should match loop output."""
+        import os
+        E_local = 32
+        D = 64
+        expert_dim = 128
+        cap_total = 8
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Loop output
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        loop_out = model._run_local_experts(dispatched)
+        mx.eval(loop_out)
+
+        # Chunked output (chunk_e=8)
+        chunked_out = model._run_local_experts_batched_chunked(dispatched, chunk_e=8)
+        mx.eval(chunked_out)
+
+        self.assertEqual(loop_out.shape, chunked_out.shape)
+        self.assertTrue(
+            mx.allclose(loop_out, chunked_out, atol=1e-5, rtol=1e-4).item(),
+            f"Chunked output differs from loop. Max diff: {mx.max(mx.abs(loop_out - chunked_out)).item()}"
+        )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+    def test_chunked_various_sizes(self):
+        """Test chunked batched with different chunk_e values."""
+        import os
+        E_local = 24
+        D = 64
+        expert_dim = 128
+        cap_total = 4
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Reference: loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        ref_out = model._run_local_experts(dispatched)
+        mx.eval(ref_out)
+
+        # Test various chunk sizes including edge cases
+        for chunk_e in [1, 4, 6, 8, 12, 24]:
+            with self.subTest(chunk_e=chunk_e):
+                out = model._run_local_experts_batched_chunked(dispatched, chunk_e=chunk_e)
+                mx.eval(out)
+                self.assertEqual(ref_out.shape, out.shape)
+                self.assertTrue(
+                    mx.allclose(ref_out, out, atol=1e-5, rtol=1e-4).item(),
+                    f"chunk_e={chunk_e}: max diff={mx.max(mx.abs(ref_out - out)).item()}"
+                )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+
+    def test_chunked_auto_routing_large_E(self):
+        """With E_local > 64, batched mode should use chunked path."""
+        import os
+        E_local = 72
+        D = 32
+        expert_dim = 64
+        cap_total = 2
+
+        model = MixtureOfExperts(
+            hidden_dim=D,
+            expert_dim=expert_dim,
+            num_experts=E_local,
+            top_k=2,
+            capacity_factor=1.25,
+        )
+        model.set_dtype(mx.float32)
+        mx.eval(model.parameters())
+
+        dispatched = mx.random.normal((E_local, cap_total, D))
+        mx.eval(dispatched)
+
+        # Reference: loop
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "loop"
+        model._cached_stacked = None
+        ref_out = model._run_local_experts(dispatched)
+        mx.eval(ref_out)
+
+        # Batched mode with E_local=72 > 64 should auto-chunk
+        os.environ["MLX_MOE_EP_LOCAL_FFN"] = "batched"
+        os.environ["MLX_MOE_EP_LOCAL_FFN_CHUNK_E"] = "16"
+        model._cached_stacked = None
+        batched_out = model._run_local_experts(dispatched)
+        mx.eval(batched_out)
+
+        self.assertEqual(ref_out.shape, batched_out.shape)
+        self.assertTrue(
+            mx.allclose(ref_out, batched_out, atol=1e-5, rtol=1e-4).item(),
+            f"Auto-chunked output differs. Max diff: {mx.max(mx.abs(ref_out - batched_out)).item()}"
+        )
+
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN", None)
+        os.environ.pop("MLX_MOE_EP_LOCAL_FFN_CHUNK_E", None)
+
 
 class TestZeroCopyCombine(unittest.TestCase):
     """Tests for zero-copy dual-src combine Metal kernel."""
