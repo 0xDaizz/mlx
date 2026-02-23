@@ -12,6 +12,8 @@
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/distributed/moe_metrics.h"
+#include "mlx/distributed/moe_policy.h"
 #include "mlx/distributed/ops.h"
 #include "mlx/distributed/primitives.h"
 #include "mlx/fence.h"
@@ -443,6 +445,11 @@ void MoeDispatchExchange::eval_gpu(
                 << ". Falling back to CPU.\n";
     });
 
+    // Record failure + metrics
+    MoePolicy::global().record_metal_failure();
+    MoeMetrics::global().fallback_to_cpu_count.fetch_add(
+        1, std::memory_order_relaxed);
+
     // Flush any partial GPU state before CPU fallback
     try {
       gpu::synchronize(stream());
@@ -779,126 +786,272 @@ void MoeCombineExchange::eval_gpu(
           count_send,
           count_recv);
 
-      // --------------- Step 7: decode recv responses -> build scatter indices
-      // --- resp_recv contains [token_slot32(in 16B header) | payload] We need
-      // to:
-      //   1. Build unified_src workspace that contains all data rows
-      //      (expert_out rows for local + received response rows for remote)
-      //   2. Build src_idx[N*top_k] mapping (n,k) -> row in unified_src
-      //   3. Run moe_combine_weighted_sum
+      // --------------- Step 7-8: build data sources + weighted sum
+      // --------------- Check zero-copy feature flag
+      const char* zc_env = std::getenv("MLX_MOE_EP_ZERO_COPY");
+      bool use_zero_copy = zc_env && std::string(zc_env) == "1";
 
-      // unified_src layout:
-      //   Rows 0..E_local*cap_total-1  = expert_out (for local lookups)
-      //   Rows E_local*cap_total..      = received response payloads
-      int eo_total_rows = experts_per_device * cap_total;
-      int unified_total_rows = eo_total_rows + peer_res_count;
+      if (use_zero_copy) {
+        // ===== Zero-copy dual-src path =====
+        // Instead of copying expert_out into unified_src, use dual-src kernel
+        // that reads from expert_out (local) and remote_buf (remote)
+        // separately.
 
-      // Allocate unified_src
-      size_t unified_nbytes =
-          static_cast<size_t>(unified_total_rows) * D_val * elem_size;
-      array unified_src({unified_total_rows, D_val}, dtype, nullptr, {});
-      unified_src.set_data(allocator::malloc(unified_nbytes));
+        // Build src_idx and src_which on CPU
+        std::vector<int32_t> src_idx_vec(N * top_k, -1);
+        std::vector<int32_t> src_which_vec(N * top_k, -1); // -1 = skip
 
-      // Copy expert_out into unified_src base region
-      // After synchronize, CPU can safely memcpy from expert_out (UMA)
-      std::memcpy(
-          unified_src.data<void>(),
-          expert_out.data<void>(),
-          static_cast<size_t>(eo_total_rows) * D_val * elem_size);
-
-      // Build src_idx on CPU
-      // Initialize all to -1
-      std::vector<int32_t> src_idx_vec(N * top_k, -1);
-
-      // Local entries: src_idx -> flat_idx in expert_out = row in unified_src
-      for (auto& le : local_entries) {
-        src_idx_vec[le.nk_idx] = le.flat_idx;
-      }
-
-      // Decode responses and scatter payloads into unified_src
-      if (peer_res_count > 0) {
-        auto* resp_recv_ptr = resp_recv.data<uint8_t>();
-
-        // Build a map from token_slot -> response index for the scatter
-        std::vector<int32_t> resp_flat_idx_vec(peer_res_count);
-
-        for (int i = 0; i < peer_res_count; i++) {
-          const uint8_t* resp_row =
-              resp_recv_ptr + static_cast<size_t>(i) * resp_stride;
-          uint32_t token_slot;
-          std::memcpy(&token_slot, resp_row, 4);
-
-          if (token_slot >= static_cast<uint32_t>(N * top_k)) {
-            throw std::runtime_error(
-                "[MoeCombineExchange::eval_gpu] invalid token_slot=" +
-                std::to_string(token_slot));
-          }
-
-          // This response goes to row eo_total_rows + i in unified_src
-          int unified_row = eo_total_rows + i;
-          src_idx_vec[static_cast<int>(token_slot)] = unified_row;
-
-          // Target row in unified_src for packet_scatter
-          resp_flat_idx_vec[i] = unified_row;
+        // Local entries: index into expert_out
+        for (auto& le : local_entries) {
+          src_idx_vec[le.nk_idx] = le.flat_idx;
+          src_which_vec[le.nk_idx] = 0; // local
         }
 
-        // GPU: scatter received response payloads into unified_src
-        array resp_flat_buf({peer_res_count}, int32, nullptr, {});
-        resp_flat_buf.set_data(
-            allocator::malloc(peer_res_count * sizeof(int32_t)));
-        std::memcpy(
-            resp_flat_buf.data<int32_t>(),
-            resp_flat_idx_vec.data(),
-            peer_res_count * sizeof(int32_t));
+        // Remote entries: decode responses and scatter into remote_buf
+        if (peer_res_count > 0) {
+          // Allocate remote_buf [peer_res_count, D]
+          array remote_buf({peer_res_count, D_val}, dtype, nullptr, {});
+          remote_buf.set_data(
+              allocator::malloc(
+                  static_cast<size_t>(peer_res_count) * D_val * elem_size));
 
-        auto scatter_kernel = get_moe_kernel(d, "moe_packet_scatter", dtype);
-        auto& enc_scatter = d.get_command_encoder(s.index);
-        enc_scatter.set_compute_pipeline_state(scatter_kernel);
-        enc_scatter.set_input_array(resp_recv, 0);
-        enc_scatter.set_output_array(unified_src, 1);
-        enc_scatter.set_input_array(resp_flat_buf, 2);
-        enc_scatter.set_bytes(D_val, 3);
-        enc_scatter.set_bytes(peer_res_count, 4);
-        enc_scatter.set_bytes(resp_stride, 5);
+          auto* resp_recv_ptr = resp_recv.data<uint8_t>();
+          std::vector<int32_t> resp_flat_idx_vec(peer_res_count);
+
+          for (int i = 0; i < peer_res_count; i++) {
+            const uint8_t* resp_row =
+                resp_recv_ptr + static_cast<size_t>(i) * resp_stride;
+            uint32_t token_slot;
+            std::memcpy(&token_slot, resp_row, 4);
+
+            if (token_slot >= static_cast<uint32_t>(N * top_k)) {
+              throw std::runtime_error(
+                  "[MoeCombineExchange::eval_gpu] invalid token_slot=" +
+                  std::to_string(token_slot));
+            }
+
+            // This response row goes to remote_buf[i]
+            src_idx_vec[static_cast<int>(token_slot)] = i;
+            src_which_vec[static_cast<int>(token_slot)] = 1; // remote
+
+            // Target row in remote_buf for packet_scatter
+            resp_flat_idx_vec[i] = i;
+          }
+
+          // GPU: scatter received response payloads into remote_buf
+          array resp_flat_buf({peer_res_count}, int32, nullptr, {});
+          resp_flat_buf.set_data(
+              allocator::malloc(peer_res_count * sizeof(int32_t)));
+          std::memcpy(
+              resp_flat_buf.data<int32_t>(),
+              resp_flat_idx_vec.data(),
+              peer_res_count * sizeof(int32_t));
+
+          auto scatter_kernel = get_moe_kernel(d, "moe_packet_scatter", dtype);
+          auto& enc_scatter = d.get_command_encoder(s.index);
+          enc_scatter.set_compute_pipeline_state(scatter_kernel);
+          enc_scatter.set_input_array(resp_recv, 0);
+          enc_scatter.set_output_array(remote_buf, 1);
+          enc_scatter.set_input_array(resp_flat_buf, 2);
+          enc_scatter.set_bytes(D_val, 3);
+          enc_scatter.set_bytes(peer_res_count, 4);
+          enc_scatter.set_bytes(resp_stride, 5);
+
+          int tx = std::min(D_val, 256);
+          MTL::Size grid_dims = MTL::Size(D_val, peer_res_count, 1);
+          MTL::Size group_dims = MTL::Size(tx, 1, 1);
+          enc_scatter.dispatch_threads(grid_dims, group_dims);
+
+          d.add_temporary(resp_flat_buf, s.index);
+          d.add_temporary(resp_recv, s.index);
+
+          // Build GPU buffers for src_idx and src_which
+          array src_idx_buf({N * top_k}, int32, nullptr, {});
+          src_idx_buf.set_data(allocator::malloc(N * top_k * sizeof(int32_t)));
+          std::memcpy(
+              src_idx_buf.data<int32_t>(),
+              src_idx_vec.data(),
+              N * top_k * sizeof(int32_t));
+
+          array src_which_buf({N * top_k}, int32, nullptr, {});
+          src_which_buf.set_data(
+              allocator::malloc(N * top_k * sizeof(int32_t)));
+          std::memcpy(
+              src_which_buf.data<int32_t>(),
+              src_which_vec.data(),
+              N * top_k * sizeof(int32_t));
+
+          // Launch dual-src weighted sum kernel
+          auto ws_kernel =
+              get_moe_kernel(d, "moe_combine_weighted_sum_dual_src", dtype);
+          auto& enc_ws = d.get_command_encoder(s.index);
+          enc_ws.set_compute_pipeline_state(ws_kernel);
+          enc_ws.set_input_array(expert_out, 0); // local_src
+          enc_ws.set_input_array(remote_buf, 1); // remote_src
+          enc_ws.set_output_array(outputs[0], 2); // output
+          enc_ws.set_input_array(orig_tok, 3); // original
+          enc_ws.set_input_array(weights_in, 4); // weights
+          enc_ws.set_input_array(src_idx_buf, 5); // src_idx
+          enc_ws.set_input_array(src_which_buf, 6); // src_which
+          enc_ws.set_bytes(D_val, 7);
+          enc_ws.set_bytes(N, 8);
+          enc_ws.set_bytes(top_k, 9);
+
+          {
+            int tx2 = std::min(D_val, 256);
+            MTL::Size grid_dims2 = MTL::Size(D_val, N, 1);
+            MTL::Size group_dims2 = MTL::Size(tx2, 1, 1);
+            enc_ws.dispatch_threads(grid_dims2, group_dims2);
+          }
+
+          d.add_temporary(remote_buf, s.index);
+          d.add_temporary(src_idx_buf, s.index);
+          d.add_temporary(src_which_buf, s.index);
+        } else {
+          // No remote data — all local. Use dual-src kernel with empty
+          // remote_buf. Allocate minimal remote_buf (1 element to avoid null
+          // pointer)
+          array remote_buf({1, D_val}, dtype, nullptr, {});
+          remote_buf.set_data(allocator::malloc(D_val * elem_size));
+          std::memset(remote_buf.data<void>(), 0, D_val * elem_size);
+
+          array src_idx_buf({N * top_k}, int32, nullptr, {});
+          src_idx_buf.set_data(allocator::malloc(N * top_k * sizeof(int32_t)));
+          std::memcpy(
+              src_idx_buf.data<int32_t>(),
+              src_idx_vec.data(),
+              N * top_k * sizeof(int32_t));
+
+          array src_which_buf({N * top_k}, int32, nullptr, {});
+          src_which_buf.set_data(
+              allocator::malloc(N * top_k * sizeof(int32_t)));
+          std::memcpy(
+              src_which_buf.data<int32_t>(),
+              src_which_vec.data(),
+              N * top_k * sizeof(int32_t));
+
+          auto ws_kernel =
+              get_moe_kernel(d, "moe_combine_weighted_sum_dual_src", dtype);
+          auto& enc_ws = d.get_command_encoder(s.index);
+          enc_ws.set_compute_pipeline_state(ws_kernel);
+          enc_ws.set_input_array(expert_out, 0);
+          enc_ws.set_input_array(remote_buf, 1);
+          enc_ws.set_output_array(outputs[0], 2);
+          enc_ws.set_input_array(orig_tok, 3);
+          enc_ws.set_input_array(weights_in, 4);
+          enc_ws.set_input_array(src_idx_buf, 5);
+          enc_ws.set_input_array(src_which_buf, 6);
+          enc_ws.set_bytes(D_val, 7);
+          enc_ws.set_bytes(N, 8);
+          enc_ws.set_bytes(top_k, 9);
+
+          {
+            int tx2 = std::min(D_val, 256);
+            MTL::Size grid_dims2 = MTL::Size(D_val, N, 1);
+            MTL::Size group_dims2 = MTL::Size(tx2, 1, 1);
+            enc_ws.dispatch_threads(grid_dims2, group_dims2);
+          }
+
+          d.add_temporary(remote_buf, s.index);
+          d.add_temporary(src_idx_buf, s.index);
+          d.add_temporary(src_which_buf, s.index);
+        }
+      } else {
+        // ===== Original unified_src path =====
+        int eo_total_rows = experts_per_device * cap_total;
+        int unified_total_rows = eo_total_rows + peer_res_count;
+
+        size_t unified_nbytes =
+            static_cast<size_t>(unified_total_rows) * D_val * elem_size;
+        array unified_src({unified_total_rows, D_val}, dtype, nullptr, {});
+        unified_src.set_data(allocator::malloc(unified_nbytes));
+
+        std::memcpy(
+            unified_src.data<void>(),
+            expert_out.data<void>(),
+            static_cast<size_t>(eo_total_rows) * D_val * elem_size);
+
+        std::vector<int32_t> src_idx_vec(N * top_k, -1);
+
+        for (auto& le : local_entries) {
+          src_idx_vec[le.nk_idx] = le.flat_idx;
+        }
+
+        if (peer_res_count > 0) {
+          auto* resp_recv_ptr = resp_recv.data<uint8_t>();
+          std::vector<int32_t> resp_flat_idx_vec(peer_res_count);
+
+          for (int i = 0; i < peer_res_count; i++) {
+            const uint8_t* resp_row =
+                resp_recv_ptr + static_cast<size_t>(i) * resp_stride;
+            uint32_t token_slot;
+            std::memcpy(&token_slot, resp_row, 4);
+
+            if (token_slot >= static_cast<uint32_t>(N * top_k)) {
+              throw std::runtime_error(
+                  "[MoeCombineExchange::eval_gpu] invalid token_slot=" +
+                  std::to_string(token_slot));
+            }
+
+            int unified_row = eo_total_rows + i;
+            src_idx_vec[static_cast<int>(token_slot)] = unified_row;
+            resp_flat_idx_vec[i] = unified_row;
+          }
+
+          array resp_flat_buf({peer_res_count}, int32, nullptr, {});
+          resp_flat_buf.set_data(
+              allocator::malloc(peer_res_count * sizeof(int32_t)));
+          std::memcpy(
+              resp_flat_buf.data<int32_t>(),
+              resp_flat_idx_vec.data(),
+              peer_res_count * sizeof(int32_t));
+
+          auto scatter_kernel = get_moe_kernel(d, "moe_packet_scatter", dtype);
+          auto& enc_scatter = d.get_command_encoder(s.index);
+          enc_scatter.set_compute_pipeline_state(scatter_kernel);
+          enc_scatter.set_input_array(resp_recv, 0);
+          enc_scatter.set_output_array(unified_src, 1);
+          enc_scatter.set_input_array(resp_flat_buf, 2);
+          enc_scatter.set_bytes(D_val, 3);
+          enc_scatter.set_bytes(peer_res_count, 4);
+          enc_scatter.set_bytes(resp_stride, 5);
+
+          int tx = std::min(D_val, 256);
+          MTL::Size grid_dims = MTL::Size(D_val, peer_res_count, 1);
+          MTL::Size group_dims = MTL::Size(tx, 1, 1);
+          enc_scatter.dispatch_threads(grid_dims, group_dims);
+
+          d.add_temporary(resp_flat_buf, s.index);
+          d.add_temporary(resp_recv, s.index);
+        }
+
+        array src_idx_buf({N * top_k}, int32, nullptr, {});
+        src_idx_buf.set_data(allocator::malloc(N * top_k * sizeof(int32_t)));
+        std::memcpy(
+            src_idx_buf.data<int32_t>(),
+            src_idx_vec.data(),
+            N * top_k * sizeof(int32_t));
+
+        auto ws_kernel = get_moe_kernel(d, "moe_combine_weighted_sum", dtype);
+        auto& enc_ws = d.get_command_encoder(s.index);
+        enc_ws.set_compute_pipeline_state(ws_kernel);
+        enc_ws.set_input_array(unified_src, 0); // data_src
+        enc_ws.set_output_array(outputs[0], 1); // output
+        enc_ws.set_input_array(orig_tok, 2); // original
+        enc_ws.set_input_array(weights_in, 3); // weights
+        enc_ws.set_input_array(src_idx_buf, 4); // src_idx
+        enc_ws.set_bytes(D_val, 5);
+        enc_ws.set_bytes(N, 6);
+        enc_ws.set_bytes(top_k, 7);
 
         int tx = std::min(D_val, 256);
-        MTL::Size grid_dims = MTL::Size(D_val, peer_res_count, 1);
+        MTL::Size grid_dims = MTL::Size(D_val, N, 1);
         MTL::Size group_dims = MTL::Size(tx, 1, 1);
-        enc_scatter.dispatch_threads(grid_dims, group_dims);
+        enc_ws.dispatch_threads(grid_dims, group_dims);
 
-        d.add_temporary(resp_flat_buf, s.index);
-        d.add_temporary(resp_recv, s.index);
+        d.add_temporary(unified_src, s.index);
+        d.add_temporary(src_idx_buf, s.index);
       }
-
-      // --------------- Step 8: GPU combine_weighted_sum ---------------
-      // Build src_idx GPU buffer
-      array src_idx_buf({N * top_k}, int32, nullptr, {});
-      src_idx_buf.set_data(allocator::malloc(N * top_k * sizeof(int32_t)));
-      std::memcpy(
-          src_idx_buf.data<int32_t>(),
-          src_idx_vec.data(),
-          N * top_k * sizeof(int32_t));
-
-      auto ws_kernel = get_moe_kernel(d, "moe_combine_weighted_sum", dtype);
-      auto& enc_ws = d.get_command_encoder(s.index);
-      enc_ws.set_compute_pipeline_state(ws_kernel);
-      enc_ws.set_input_array(unified_src, 0); // data_src
-      enc_ws.set_output_array(outputs[0], 1); // output
-      enc_ws.set_input_array(orig_tok, 2); // original
-      enc_ws.set_input_array(weights_in, 3); // weights
-      enc_ws.set_input_array(src_idx_buf, 4); // src_idx
-      enc_ws.set_bytes(D_val, 5);
-      enc_ws.set_bytes(N, 6);
-      enc_ws.set_bytes(top_k, 7);
-
-      int tx = std::min(D_val, 256);
-      MTL::Size grid_dims = MTL::Size(D_val, N, 1);
-      MTL::Size group_dims = MTL::Size(tx, 1, 1);
-      enc_ws.dispatch_threads(grid_dims, group_dims);
-
-      // Keep temporaries alive
-      d.add_temporary(unified_src, s.index);
-      d.add_temporary(src_idx_buf, s.index);
     }
 
   } catch (const std::exception& e) {
@@ -915,6 +1068,11 @@ void MoeCombineExchange::eval_gpu(
       std::cerr << "[MoE EP] Metal eval_gpu failed: " << e.what()
                 << ". Falling back to CPU.\n";
     });
+
+    // Record failure + metrics
+    MoePolicy::global().record_metal_failure();
+    MoeMetrics::global().fallback_to_cpu_count.fetch_add(
+        1, std::memory_order_relaxed);
 
     // Flush any partial GPU state before CPU fallback
     try {

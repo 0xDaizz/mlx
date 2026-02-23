@@ -436,10 +436,6 @@ void init_distributed(nb::module_& parent_module) {
           group (Group, optional): Distributed group. Default: global group.
           deterministic (bool, optional): Use token-order based slot assignment.
             Default: ``True``.
-          backend (str, optional): Compute backend for the fused primitive.
-            ``"auto"`` selects CPU for small workloads (N <= 64) and Metal
-            for large workloads (N >= 320). ``"cpu"`` forces the CPU path.
-            ``"metal"`` forces the Metal GPU path. Default: ``"cpu"``.
           stream (Stream, optional): Stream or device. Default: ``None``.
 
         Returns:
@@ -507,13 +503,74 @@ void init_distributed(nb::module_& parent_module) {
           capacity (int): Per-expert capacity.
           group (Group, optional): Distributed group. Default: global group.
           deterministic (bool, optional): Default: ``True``.
-          backend (str, optional): Compute backend for the fused primitive.
-            ``"auto"`` selects CPU for small workloads (N <= 64) and Metal
-            for large workloads (N >= 320). ``"cpu"`` forces the CPU path.
-            ``"metal"`` forces the Metal GPU path. Default: ``"cpu"``.
           stream (Stream, optional): Stream or device. Default: ``None``.
 
         Returns:
           array: Combined tokens of shape ``[N, D]``.
+      )pbdoc");
+
+  m.def(
+      "moe_ep_stats",
+      []() {
+        auto stats = mx::distributed::moe_ep_stats();
+        nb::dict result;
+        for (const auto& [key, val] : stats) {
+          result[nb::cast(key)] = nb::cast(val);
+        }
+        return result;
+      },
+      nb::sig("def moe_ep_stats() -> dict"),
+      R"pbdoc(
+        Return a snapshot of MoE EP runtime metrics.
+
+        Returns:
+          dict: A dictionary mapping metric names to uint64 values.
+            Keys include: dispatch_calls, combine_calls, cpu_backend_calls,
+            metal_backend_calls, fallback_to_cpu_count, total_tokens_dispatched,
+            warmup_completed, overflow_count, remote_tokens_total,
+            local_tokens_total, dispatch_route_cpu_us, dispatch_comm_us,
+            combine_comm_us, dispatch_total_us, combine_total_us.
+      )pbdoc");
+
+  m.def(
+      "moe_ep_reset_stats",
+      []() { mx::distributed::moe_ep_reset_stats(); },
+      nb::sig("def moe_ep_reset_stats() -> None"),
+      R"pbdoc(
+        Reset all MoE EP runtime metrics to zero.
+      )pbdoc");
+
+  m.def(
+      "moe_ep_warmup",
+      [](std::optional<mx::distributed::Group> group,
+         int num_experts,
+         int capacity,
+         int hidden_dim,
+         mx::Dtype dtype) {
+        mx::distributed::moe_ep_warmup(
+            group, num_experts, capacity, hidden_dim, dtype);
+      },
+      nb::kw_only(),
+      "group"_a = nb::none(),
+      "num_experts"_a = 0,
+      "capacity"_a = 0,
+      "hidden_dim"_a = 0,
+      "dtype"_a = mx::float16,
+      nb::sig(
+          "def moe_ep_warmup(*, group: Optional[Group] = None, "
+          "num_experts: int = 0, capacity: int = 0, "
+          "hidden_dim: int = 0, dtype: Dtype = mx.float16) -> None"),
+      R"pbdoc(
+        Warm up MoE EP infrastructure.
+
+        Primes RDMA paths, triggers Metal kernel JIT compilation,
+        and warms up the memory allocator. Idempotent.
+
+        Args:
+          group (Group, optional): Distributed group. Default: global group.
+          num_experts (int): Total experts. 0 skips Metal warmup.
+          capacity (int): Per-expert capacity. 0 skips Metal warmup.
+          hidden_dim (int): Hidden dimension D. 0 skips Metal warmup.
+          dtype (Dtype): Data type for warmup tensors. Default: float16.
       )pbdoc");
 }

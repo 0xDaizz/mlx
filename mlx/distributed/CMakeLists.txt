@@ -3,7 +3,10 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ops.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/distributed_impl.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/distributed_impl.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/moe_policy.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/moe_metrics.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/moe_warmup.cpp)
 
 if(MLX_BUILD_CPU AND NOT WIN32)
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)

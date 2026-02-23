@@ -98,6 +98,18 @@ get_moe_kernel(metal::Device& d, const std::string& base_name, Dtype dtype) {
       source += "constant int& N [[buffer(6)]], ";
       source += "constant int& top_k [[buffer(7)]], ";
       source += "uint2 gid [[thread_position_in_grid]]);\n";
+    } else if (base_name == "moe_combine_weighted_sum_dual_src") {
+      source += "const device " + type_str + "* local_src [[buffer(0)]], ";
+      source += "const device " + type_str + "* remote_src [[buffer(1)]], ";
+      source += "device " + type_str + "* output [[buffer(2)]], ";
+      source += "const device " + type_str + "* original [[buffer(3)]], ";
+      source += "const device float* weights [[buffer(4)]], ";
+      source += "const device int* src_idx [[buffer(5)]], ";
+      source += "const device int* src_which [[buffer(6)]], ";
+      source += "constant int& D [[buffer(7)]], ";
+      source += "constant int& N [[buffer(8)]], ";
+      source += "constant int& top_k [[buffer(9)]], ";
+      source += "uint2 gid [[thread_position_in_grid]]);\n";
     } else if (base_name == "moe_packet_gather") {
       source += "const device " + type_str + "* source [[buffer(0)]], ";
       source += "device uint8_t* packet [[buffer(1)]], ";

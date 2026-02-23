@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 #include "mlx/api.h"
 #include "mlx/distributed/distributed.h"
@@ -81,5 +83,21 @@ MLX_API array moe_combine_exchange(
     bool deterministic = true,
     const std::string& backend = "cpu",
     StreamOrDevice s = {});
+
+// --- Phase 5: MoE EP Production APIs ---
+
+/// Return a snapshot of MoE EP runtime metrics.
+MLX_API std::unordered_map<std::string, uint64_t> moe_ep_stats();
+
+/// Reset all MoE EP runtime metrics to zero.
+MLX_API void moe_ep_reset_stats();
+
+/// Warm up MoE EP infrastructure (RDMA + Metal JIT + allocator).
+MLX_API void moe_ep_warmup(
+    std::optional<Group> group = std::nullopt,
+    int num_experts = 0,
+    int capacity = 0,
+    int hidden_dim = 0,
+    Dtype dtype = float16);
 
 } // namespace mlx::core::distributed

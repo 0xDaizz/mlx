@@ -8,6 +8,9 @@
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/distributed/distributed_impl.h"
+#include "mlx/distributed/moe_metrics.h"
+#include "mlx/distributed/moe_policy.h"
+#include "mlx/distributed/moe_warmup.h"
 #include "mlx/distributed/ops.h"
 #include "mlx/distributed/primitives.h"
 
@@ -23,13 +26,9 @@ Group to_group(std::optional<Group> group) {
   }
 }
 
-// Auto mode: resolve to CPU (Phase 5 policy removed for PR1 simplification)
-MoeBackend resolve_auto_backend(
-    int /* N */,
-    int /* top_k */,
-    int /* D */,
-    int /* elem_size */) {
-  return MoeBackend::Cpu;
+// Auto mode: select CPU or Metal based on work size
+MoeBackend resolve_auto_backend(int N, int top_k, int D, int elem_size) {
+  return MoePolicy::global().resolve(N, top_k, D, elem_size);
 }
 
 MoeBackend resolve_backend_str(const std::string& backend) {
@@ -307,20 +306,21 @@ std::pair<array, array> moe_dispatch_exchange(
 
   auto moe_backend = resolve_backend_str(backend);
 
-  // Resolve Auto → CPU
+  // Resolve Auto → concrete backend
   if (moe_backend == MoeBackend::Auto) {
-    moe_backend = MoeBackend::Cpu;
+    int elem_size = static_cast<int>(tokens.itemsize());
+    moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
   }
 
-  // ws > 2: Metal not yet optimized, fall back to CPU
-  if (moe_backend == MoeBackend::Metal && world_size > 2) {
-    static std::once_flag warned;
-    std::call_once(warned, []() {
-      std::cerr
-          << "[MoE EP] Metal backend not yet optimized for world_size > 2, "
-          << "falling back to CPU path." << std::endl;
-    });
-    moe_backend = MoeBackend::Cpu;
+  // Metrics: record dispatch call
+  auto& metrics = MoeMetrics::global();
+  metrics.dispatch_calls.fetch_add(1, std::memory_order_relaxed);
+  metrics.total_tokens_dispatched.fetch_add(
+      static_cast<uint64_t>(N), std::memory_order_relaxed);
+  if (moe_backend == MoeBackend::Metal) {
+    metrics.metal_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    metrics.cpu_backend_calls.fetch_add(1, std::memory_order_relaxed);
   }
 
   auto stream = resolve_moe_stream(moe_backend, s);
@@ -425,20 +425,20 @@ array moe_combine_exchange(
 
   auto moe_backend = resolve_backend_str(backend);
 
-  // Resolve Auto → CPU
+  // Resolve Auto → concrete backend
   if (moe_backend == MoeBackend::Auto) {
-    moe_backend = MoeBackend::Cpu;
+    int elem_size = static_cast<int>(expert_outputs.itemsize());
+    int top_k = route_indices.shape(1);
+    moe_backend = resolve_auto_backend(N, top_k, D, elem_size);
   }
 
-  // ws > 2: Metal not yet optimized, fall back to CPU
-  if (moe_backend == MoeBackend::Metal && world_size > 2) {
-    static std::once_flag warned;
-    std::call_once(warned, []() {
-      std::cerr
-          << "[MoE EP] Metal backend not yet optimized for world_size > 2, "
-          << "falling back to CPU path." << std::endl;
-    });
-    moe_backend = MoeBackend::Cpu;
+  // Metrics: record combine call
+  auto& metrics = MoeMetrics::global();
+  metrics.combine_calls.fetch_add(1, std::memory_order_relaxed);
+  if (moe_backend == MoeBackend::Metal) {
+    metrics.metal_backend_calls.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    metrics.cpu_backend_calls.fetch_add(1, std::memory_order_relaxed);
   }
 
   auto stream = resolve_moe_stream(moe_backend, s);
@@ -449,6 +449,14 @@ array moe_combine_exchange(
       std::make_shared<MoeCombineExchange>(
           stream, group, num_experts, capacity, deterministic, moe_backend),
       {expert_outputs, route_indices, weights, original_tokens});
+}
+
+std::unordered_map<std::string, uint64_t> moe_ep_stats() {
+  return MoeMetrics::global().snapshot();
+}
+
+void moe_ep_reset_stats() {
+  MoeMetrics::global().reset();
 }
 
 } // namespace mlx::core::distributed
